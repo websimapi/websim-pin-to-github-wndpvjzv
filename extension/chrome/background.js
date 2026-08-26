@@ -12,26 +12,6 @@
   let logQueue = Promise.resolve();
   const trackedWebsimRequests = new Map();
   const syncInFlight = new Set();
-  const activeSyncs = new Set();
-
-  function normalizedTabId(tabId) {
-    return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
-  }
-
-  function syncKey(projectId, tabId) {
-    const scope = normalizedTabId(tabId);
-    return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`;
-  }
-
-  function activeSyncForTab(tabId) {
-    const scope = normalizedTabId(tabId);
-    const prefix = `${scope === null ? 'background' : `tab:${scope}`}:`;
-    return [...activeSyncs].some((key) => key.startsWith(prefix));
-  }
-
-  function requestKey(details) {
-    return `${normalizedTabId(details.tabId) ?? 'background'}:${details.requestId}`;
-  }
 
   function debugLog(event, detail = {}) {
     const entry = { at: new Date().toISOString(), event, ...detail };
@@ -172,14 +152,12 @@
     return matchingKey ? versions[matchingKey] : null;
   }
 
-  function setSyncIndicator(active, tabId = null) {
+  function setSyncIndicator(active) {
     const action = api.action || api.browserAction;
     if (!action) return;
-    const scope = normalizedTabId(tabId);
-    const target = scope === null ? {} : { tabId: scope };
-    Promise.resolve(action.setBadgeText?.({ ...target, text: active ? '…' : '' })).catch(() => {});
-    Promise.resolve(action.setBadgeBackgroundColor?.({ ...target, color: active ? '#d9ee65' : '#11131a' })).catch(() => {});
-    Promise.resolve(action.setTitle?.({ ...target, title: active ? 'Pin to GitHub · syncing…' : 'Pin to GitHub' })).catch(() => {});
+    Promise.resolve(action.setBadgeText?.({ text: active ? '…' : '' })).catch(() => {});
+    Promise.resolve(action.setBadgeBackgroundColor?.({ color: active ? '#d9ee65' : '#11131a' })).catch(() => {});
+    Promise.resolve(action.setTitle?.({ title: active ? 'Pin to GitHub · syncing…' : 'Pin to GitHub' })).catch(() => {});
   }
 
   async function config() {
@@ -580,7 +558,7 @@
 
   async function sync(payload, tabId) {
     const settings = await config();
-    await debugLog('sync.request.received', { tabId: normalizedTabId(tabId), projectId: payload?.projectId || null, url: payload?.url ? String(payload.url).split(/[?#]/)[0] : null, title: payload?.title || null });
+    await debugLog('sync.request.received', { tabId: tabId || null, projectId: payload?.projectId || null, url: payload?.url ? String(payload.url).split(/[?#]/)[0] : null, title: payload?.title || null });
     if (!settings.enabled) {
       await debugLog('sync.blocked', { reason: 'auto-sync-disabled' });
       throw new Error('Auto-sync is paused in the extension popup');
@@ -595,14 +573,11 @@
     try {
       projectId = await resolveProjectId(payload);
       if (!projectId) throw new Error('Could not identify the pinned project');
-      const runKey = syncKey(projectId, tabId);
-      if (syncInFlight.has(runKey)) {
-        await debugLog('sync.skipped-in-flight', { projectId, tabId: normalizedTabId(tabId) });
+      if (syncInFlight.has(projectId)) {
+        await debugLog('sync.skipped-in-flight', { projectId });
         return { ok: true, inProgress: true, message: 'A sync for this project is already in progress' };
       }
-      syncInFlight.add(runKey);
-      activeSyncs.add(runKey);
-      setSyncIndicator(true, tabId);
+      syncInFlight.add(projectId);
       stage = 'fetch-current-revision';
       const { version, revision } = await currentRevision(projectId);
       await debugLog('websim.revision.selected', { projectId, version });
@@ -629,12 +604,7 @@
       await debugLog('sync.failed', { stage, status: error.status || null, message: error.message });
       throw error;
     } finally {
-      if (projectId) {
-        const runKey = syncKey(projectId, tabId);
-        syncInFlight.delete(runKey);
-        activeSyncs.delete(runKey);
-        setSyncIndicator(activeSyncForTab(tabId), tabId);
-      }
+      if (projectId) syncInFlight.delete(projectId);
     }
   }
 
@@ -675,7 +645,7 @@
     }
     const payload = { projectId: mutation.projectId, url: tab?.url || details.documentUrl || `https://websim.com/p/${mutation.projectId}`, title: null };
     await debugLog('pin.autosync.trigger', { tabId, ...payload });
-    setSyncIndicator(true, tabId);
+    setSyncIndicator(true);
     if (tabId !== null) api.tabs.sendMessage(tabId, { type: 'SYNC_STARTED', source: 'project-patch' }).catch(() => {});
     sync(payload, tabId).then((result) => { notify(tabId, result); }).catch((error) => {
       const result = { ok: false, message: error.message };
@@ -684,7 +654,7 @@
   }
 
   async function notify(tabId, result) {
-    setSyncIndicator(activeSyncForTab(tabId), tabId);
+    if (!result.inProgress) setSyncIndicator(false);
     if (Number.isInteger(tabId) && tabId >= 0) api.tabs.sendMessage(tabId, { type: 'SYNC_RESULT', ...result }).catch(() => {});
     if (result.ok && api.notifications) {
       api.notifications.create(`pin-${Date.now()}`, { type: 'basic', title: 'Pin to GitHub', message: result.message, iconUrl: api.runtime.getURL('icon-128.png') }).catch(() => {});
@@ -718,7 +688,7 @@
         const body = requestBodySummary(details.requestBody);
         if (mutation) {
           const beforeState = readProjectMutationState(mutation.projectId);
-          trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId: details.tabId });
+          trackedWebsimRequests.set(details.requestId, { mutation, body, beforeState, tabId: details.tabId });
           debugLog('pin.candidate.request', { tabId: details.tabId, projectId: mutation.projectId, method: details.method, body });
         }
         config().then((state) => state.advancedLogs && debugLog('network.request', {
@@ -732,9 +702,9 @@
       api.webRequest.onCompleted?.addListener((details) => {
         const url = websimNetworkUrl(details.url);
         if (!url) return;
-        const tracked = trackedWebsimRequests.get(requestKey(details));
+        const tracked = trackedWebsimRequests.get(details.requestId);
         if (tracked) {
-          trackedWebsimRequests.delete(requestKey(details));
+          trackedWebsimRequests.delete(details.requestId);
           Promise.resolve(tracked.beforeState).then((beforeState) =>
             triggerAutoSync(details, tracked.mutation, tracked.body, beforeState)
           ).catch((error) => {
@@ -751,9 +721,9 @@
       api.webRequest.onErrorOccurred?.addListener((details) => {
         const url = websimNetworkUrl(details.url);
         if (!url) return;
-        const tracked = trackedWebsimRequests.get(requestKey(details));
+        const tracked = trackedWebsimRequests.get(details.requestId);
         if (tracked) {
-          trackedWebsimRequests.delete(requestKey(details));
+          trackedWebsimRequests.delete(details.requestId);
           debugLog('pin.candidate.failed', { tabId: details.tabId, projectId: tracked.mutation.projectId, error: details.error, body: tracked.body });
         }
         config().then((state) => state.advancedLogs && debugLog('network.error', {
@@ -816,7 +786,7 @@
     }
     if (message?.type === 'PIN_DETECTED') {
       debugLog('pin.message.received', { tabId: sender.tab?.id || null, senderUrl: sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload: safeDebugDetail(message.payload || {}) });
-      setSyncIndicator(true, sender.tab?.id);
+      setSyncIndicator(true);
       sync(message.payload, sender.tab?.id).then((result) => { notify(sender.tab?.id, result); sendResponse(result); })
         .catch((error) => { const result = { ok: false, message: error.message }; notify(sender.tab?.id, result); sendResponse(result); });
       return true;
@@ -825,7 +795,7 @@
       const tabId = message.tabId;
       const url = message.url || '';
       const projectId = url.match(/\/(?:c|p)\/([a-zA-Z0-9_-]+)/)?.[1] || url.match(/^https:\/\/([a-zA-Z0-9_-]+)\.c\.websim\.com/)?.[1];
-      setSyncIndicator(true, tabId);
+      setSyncIndicator(true);
       sync({ projectId, url, title: message.title }, tabId).then((result) => { notify(tabId, result); sendResponse(result); })
         .catch((error) => { const result = { ok: false, message: error.message }; notify(tabId, result); sendResponse(result); });
       return true;
