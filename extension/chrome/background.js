@@ -399,10 +399,10 @@
       revision,
       version,
       hasSlug,
-      // The slug can lag behind publication by minutes. A finalized revision
-      // is still safe to sync because generatedRepoName falls back to the
-      // project title until the canonical slug is available.
-      ready: version !== null && revision.draft !== true
+      // Keep the canonical slug requirement so a new project cannot be
+      // committed under a temporary title-based repository name. The retry
+      // loop remains active until Websim assigns the slug.
+      ready: hasSlug && version !== null && revision.draft !== true
     };
   }
 
