@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Pin to GitHub",
+  "version": "0.1.0",
+  "description": "Commit the current Websim revision to GitHub when you pin a project.",
+  "permissions": ["storage", "notifications", "tabs", "clipboardWrite"],
+  "host_permissions": [
+    "https://websim.com/*",
+    "https://*.websim.com/*",
+    "https://api.github.com/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "pin-to-github@websim.tools",
+      "strict_min_version": "121.0"
+    }
+  },
+  "action": {
+    "default_title": "Pin to GitHub",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://websim.com/*", "https://*.websim.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon.svg",
+    "48": "icon.svg",
+    "128": "icon.svg"
+  }
+}
