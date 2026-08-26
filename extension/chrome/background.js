@@ -112,6 +112,20 @@
     }
   }
 
+  function projectRevisionRead(value) {
+    try {
+      const url = new URL(value);
+      const match = url.pathname.match(/\/api\/v1\/projects\/([^/]+)\/revisions\/([^/]+)/i);
+      return match ? { projectId: decodeURIComponent(match[1]), version: decodeURIComponent(match[2]) } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function projectActivityRead(value) {
+    return projectRead(value) || projectRevisionRead(value);
+  }
+
   function decodeRequestBytes(bytes) {
     try {
       if (!bytes) return '';
@@ -252,6 +266,7 @@
     try {
       const response = await fetch(`${WS_API}${path}`, {
         credentials: 'include',
+        cache: 'no-store',
         headers: { Accept: 'application/json', 'Accept-Language': 'en-US,en;q=0.9' }
       });
       const data = await response.json().catch(() => ({}));
@@ -381,12 +396,24 @@
     automaticSyncChecks.add(checkKey);
     try {
       const linked = settings.projectMap?.[projectId];
-      if (linked) {
-        const { version } = await currentRevision(projectId);
-        if (String(knownSyncedVersion(settings, projectId)) === String(version)) {
-          await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'version-already-synced', version });
-          return { ok: true, skipped: 'version-already-synced', projectId };
-        }
+      const projectResponse = await wsJson(`/projects/${encodeURIComponent(projectId)}`);
+      const project = projectResponse?.project || projectResponse?.site || projectResponse || {};
+      const revision = projectResponse?.project_revision || projectResponse?.revision || {};
+      const version = project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
+      if (!String(project.slug || '').trim() || version === null || revision.draft === true) {
+        await debugLog('sync.page-ready.skipped', {
+          projectId,
+          tabId: normalizedTabId(tabId),
+          reason: 'project-not-ready',
+          slug: project.slug || null,
+          version,
+          draft: revision.draft ?? null
+        });
+        return { ok: true, skipped: 'project-not-ready', projectId };
+      }
+      if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) {
+        await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'version-already-synced', version });
+        return { ok: true, skipped: 'version-already-synced', projectId };
       }
       rememberProjectLogScope(projectId, tabId);
       setSyncIndicator(true, tabId);
@@ -575,6 +602,8 @@
   async function commitToGithub(files, project, revision, settings, target) {
     const basePath = repoPath(target.owner, target.repo);
     const branch = encodeURIComponent(target.branch);
+    const version = revision.version ?? revision.revision_number ?? project.version ?? '?';
+    const title = String(project.title || revision.title || project.projectId || 'Websim project').replace(/[\r\n]+/g, ' ').slice(0, 120);
     await debugLog('git.bootstrap.start', {
       owner: target.owner,
       repo: target.repo,
@@ -582,6 +611,46 @@
       emptyRepository: Boolean(target.empty),
       fileCount: Object.keys(files).length
     });
+    if (target.empty) {
+      const bootstrapPath = files['index.html'] ? 'index.html' : Object.keys(files)[0];
+      let bootstrap = null;
+      try {
+        bootstrap = await githubRequest(`${basePath}/contents/${bootstrapPath.split('/').map(encodeURIComponent).join('/')}`, settings.token, {
+          method: 'PUT',
+          body: JSON.stringify({
+            message: `v${version}: ${title}`,
+            content: toBase64(files[bootstrapPath]),
+            branch: target.defaultBranch || 'main'
+          }),
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        if (![409, 422].includes(error.status)) throw error;
+        const refreshed = await githubRequest(basePath, settings.token);
+        if (!refreshed.default_branch) throw error;
+        target.empty = false;
+      }
+      const bootstrapSha = bootstrap?.commit?.sha;
+      if (bootstrapSha) {
+        await debugLog('git.repository.initialized', {
+          owner: target.owner,
+          repo: target.repo,
+          branch: target.defaultBranch || 'main',
+          commitSha: bootstrapSha,
+          bootstrapPath
+        });
+        target.empty = false;
+        if (Object.keys(files).length === 1 && bootstrapPath === 'index.html') {
+          await debugLog('git.branch.ready', { owner: target.owner, repo: target.repo, branch: target.branch, commitSha: bootstrapSha });
+          return {
+            sha: bootstrapSha,
+            version,
+            title,
+            url: bootstrap.commit.html_url || `https://github.com/${target.owner}/${target.repo}/commit/${bootstrapSha}`
+          };
+        }
+      }
+    }
     let parentSha = null;
     let branchExists = false;
     if (!target.empty) {
@@ -619,8 +688,6 @@
       treeSha: tree.sha,
       parentSha: parentSha || null
     });
-    const version = revision.version ?? revision.revision_number ?? project.version ?? '?';
-    const title = String(project.title || revision.title || project.projectId || 'Websim project').replace(/[\r\n]+/g, ' ').slice(0, 120);
     let commit = await githubRequest(`${basePath}/git/commits`, settings.token, {
       method: 'POST',
       body: JSON.stringify({
@@ -853,7 +920,7 @@
         const mutation = details.method === 'PATCH' ? projectMutation(details.url) : null;
         const body = requestBodySummary(details.requestBody);
         const tabId = normalizedTabId(details.tabId);
-        const read = details.method === 'GET' ? projectRead(details.url) : null;
+        const read = details.method === 'GET' ? projectActivityRead(details.url) : null;
         if (mutation) {
           const beforeState = readProjectMutationState(mutation.projectId);
           trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId: details.tabId });

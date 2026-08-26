@@ -36,6 +36,9 @@
   function websimNetworkUrl(value) { try { const url = new URL(value); if (!/(^|\.)websim\.com$/i.test(url.hostname)) return null; if (!/\/api\//i.test(url.pathname) && !/(pin|pinned|bookmark|collection|save)/i.test(url.pathname)) return null; return `${url.origin}${url.pathname}`; } catch { return null; } }
   function projectMutation(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v1\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
   function projectRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v[12]\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
+  function projectRevisionRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v1\/projects\/([^/]+)\/revisions\/([^/]+)/i); return match ? { projectId:decodeURIComponent(match[1]), version:decodeURIComponent(match[2]) } : null; } catch { return null; } }
+  function projectActivityRead(value) { return projectRead(value) || projectRevisionRead(value); }
+  function projectRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v[12]\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
   function decodeRequestBytes(bytes) { try { if (!bytes) return ''; if (Array.isArray(bytes)) return new TextDecoder().decode(new Uint8Array(bytes)); return new TextDecoder().decode(bytes); } catch { return ''; } }
   function requestFieldEntries(value, prefix = '', depth = 0) { if (!value || typeof value !== 'object' || depth > 3) return []; return Object.entries(value).flatMap(([key, child]) => { const path = prefix ? `${prefix}.${key}` : key; if (child && typeof child === 'object') { if (Array.isArray(child)) return [[path, `[${child.length} items]`]]; return requestFieldEntries(child, path, depth + 1); } return [[path, child]]; }); }
   function requestBodySummary(body) {
@@ -170,11 +173,15 @@
     const checkKey=syncKey(projectId, tabId); if (automaticSyncChecks.has(checkKey)) return { ok:true, skipped:'check-in-progress', projectId };
     automaticSyncChecks.add(checkKey);
     try {
-      const linked=settings.projectMap?.[projectId];
-      if (linked) {
-        const { version } = await currentRevision(projectId);
-        if (String(knownSyncedVersion(settings, projectId)) === String(version)) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'version-already-synced', version }); return { ok:true, skipped:'version-already-synced', projectId }; }
+      const projectResponse=await wsJson(`/projects/${encodeURIComponent(projectId)}`);
+      const project=projectResponse?.project || projectResponse?.site || projectResponse || {}, revision=projectResponse?.project_revision || projectResponse?.revision || {};
+      const version=project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
+      if (!String(project.slug || '').trim() || version === null || revision.draft === true) {
+        await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'project-not-ready', slug:project.slug || null, version, draft:revision.draft ?? null });
+        return { ok:true, skipped:'project-not-ready', projectId };
       }
+      const linked=settings.projectMap?.[projectId];
+      if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'version-already-synced', version }); return { ok:true, skipped:'version-already-synced', projectId }; }
       rememberProjectLogScope(projectId, tabId); setSyncIndicator(true, tabId);
       if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type:'SYNC_STARTED', source:'project-page-ready' }).catch(() => {});
       return await sync({ ...payload, projectId }, tabId);
@@ -216,7 +223,26 @@
   }
   async function commit(files, payload, revision, settings, target) {
     const base = repoPath(target.owner, target.repo), branch = encodeURIComponent(target.branch);
+    const version = revision.version ?? revision.revision_number ?? payload.version ?? '?', title = String(payload.title || revision.title || payload.projectId || 'Websim project').replace(/[\r\n]+/g,' ').slice(0,120);
     await debugLog('git.bootstrap.start', { owner:target.owner, repo:target.repo, branch:target.branch, emptyRepository:Boolean(target.empty), fileCount:Object.keys(files).length });
+    if (target.empty) {
+      const bootstrapPath=files['index.html'] ? 'index.html' : Object.keys(files)[0];
+      let bootstrap=null;
+      try {
+        bootstrap=await gh(`${base}/contents/${bootstrapPath.split('/').map(encodeURIComponent).join('/')}`, settings.token, { method:'PUT', body:JSON.stringify({ message:`v${version}: ${title}`, content:b64(files[bootstrapPath]), branch:target.defaultBranch || 'main' }), headers:{'Content-Type':'application/json'} });
+      } catch (error) {
+        if (![409,422].includes(error.status)) throw error;
+        const refreshed=await gh(base, settings.token);
+        if (!refreshed.default_branch) throw error;
+        target.empty=false;
+      }
+      const bootstrapSha=bootstrap?.commit?.sha;
+      if (bootstrapSha) {
+        await debugLog('git.repository.initialized', { owner:target.owner, repo:target.repo, branch:target.defaultBranch || 'main', commitSha:bootstrapSha, bootstrapPath });
+        target.empty=false;
+        if (Object.keys(files).length === 1 && bootstrapPath === 'index.html') { await debugLog('git.branch.ready', { owner:target.owner, repo:target.repo, branch:target.branch, commitSha:bootstrapSha }); return { sha:bootstrapSha, version, title, url:bootstrap.commit.html_url || `https://github.com/${target.owner}/${target.repo}/commit/${bootstrapSha}` }; }
+      }
+    }
     let parentSha = null;
     let branchExists = false;
     if (!target.empty) try { parentSha = (await gh(`${base}/git/ref/heads/${branch}`, settings.token)).object?.sha || null; branchExists = Boolean(parentSha); } catch (error) {
@@ -227,7 +253,6 @@
     const entries = await Promise.all(Object.entries(files).map(async ([path, bytes]) => ({ path, mode:'100644', type:'blob', sha:(await gh(`${base}/git/blobs`, settings.token, { method:'POST', body:JSON.stringify({ content:b64(bytes), encoding:'base64' }), headers:{'Content-Type':'application/json'} })).sha })));
     const tree = await gh(`${base}/git/trees`, settings.token, { method:'POST', body:JSON.stringify({ base_tree:parent?.tree?.sha, tree:entries }), headers:{'Content-Type':'application/json'} });
     await debugLog('git.tree.created', { owner:target.owner, repo:target.repo, treeSha:tree.sha, parentSha:parentSha || null });
-    const version = revision.version ?? revision.revision_number ?? '?', title = String(payload.title || revision.title || payload.projectId || 'Websim project').replace(/[\r\n]+/g,' ').slice(0,120);
     let created = await gh(`${base}/git/commits`, settings.token, { method:'POST', body:JSON.stringify({ message:`v${version}: ${title}`, tree:tree.sha, ...(parentSha ? { parents:[parentSha] } : {}) }), headers:{'Content-Type':'application/json'} });
     await debugLog('git.commit.created', { owner:target.owner, repo:target.repo, branch:target.branch, commitSha:created.sha, parentSha:parentSha || null });
     let refParentSha = parentSha, refExists = branchExists, refUpdated = false;
@@ -308,7 +333,7 @@
       api.webRequest.onBeforeRequest.addListener((details) => {
         const url=websimNetworkUrl(details.url); if (!url) return;
         const mutation=details.method === 'PATCH' ? projectMutation(details.url) : null, body=requestBodySummary(details.requestBody);
-        const tabId=normalizedTabId(details.tabId), read=details.method === 'GET' ? projectRead(details.url) : null;
+        const tabId=normalizedTabId(details.tabId), read=details.method === 'GET' ? projectActivityRead(details.url) : null;
         if (mutation) { const beforeState=readProjectMutationState(mutation.projectId); trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId:details.tabId }); debugLog('pin.candidate.request', { tabId:details.tabId, projectId:mutation.projectId, method:details.method, body }); }
         if (read && tabId !== null) autoSyncNewProject({ projectId:read.projectId, url:details.documentUrl || details.url, title:null }, tabId).then((result) => { if (!result?.skipped) notify(tabId,result); }).catch((error) => debugLog('sync.page-ready.failed', { tabId, projectId:read.projectId, message:error.message }));
         config().then((state) => state.advancedLogs && debugLog('network.request', { requestId:details.requestId, tabId, method:details.method, type:details.type, url, ...(mutation ? { projectId:mutation.projectId, body } : {}) }));
