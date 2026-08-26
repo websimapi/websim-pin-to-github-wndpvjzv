@@ -40,6 +40,31 @@
     if (settings.branchMode === 'custom') return String(settings.customBranch || 'main').trim().replace(/[^a-zA-Z0-9._/-]/g,'-').replace(/^\/|\/$/g,'') || 'main';
     return settings.branchMode || 'main';
   }
+  async function findExistingRepository(owner, token, projectId, repoNames) {
+    for (const repoName of repoNames) {
+      try {
+        const repository = await gh(repoPath(owner, repoName), token);
+        await debugLog('repository.resolve.found', { owner, repo:repository.name || repoName, source:repoName === repoNames[0] ? 'project-map' : 'generated-name', size:repository.size ?? null, defaultBranch:repository.default_branch || null });
+        return repository;
+      } catch (error) { if (!/not found/i.test(error.message)) throw error; }
+    }
+    for (let page = 1; page <= 10; page += 1) {
+      const repositories = await gh(`/user/repos?per_page=100&page=${page}&sort=updated`, token);
+      const suffix = String(projectId || '').replace(/[^a-z0-9]/gi, '').slice(-8).toLowerCase();
+      const match = (Array.isArray(repositories) ? repositories : []).find((repository) => {
+        const name = String(repository.name || '').toLowerCase();
+        return repoNames.some((candidate) => name === String(candidate).toLowerCase()) ||
+          (suffix && name.endsWith(`-${suffix}`) && name.startsWith('websim-')) ||
+          String(repository.description || '').includes(String(projectId || ''));
+      });
+      if (match) {
+        await debugLog('repository.resolve.found', { owner, repo:match.name, source:'repository-list', size:match.size ?? null, defaultBranch:match.default_branch || null });
+        return match;
+      }
+      if (!Array.isArray(repositories) || repositories.length < 100) break;
+    }
+    return null;
+  }
   async function resolveProjectId(payload) {
     if (payload?.projectId) return payload.projectId;
     try {
@@ -61,13 +86,15 @@
   }
   async function ensureRepository(payload, revision, settings) {
     const user = await gh('/user', settings.token), owner = user.login, mapped = settings.projectMap?.[payload.projectId];
-    const name = mapped?.repo || generatedRepoName(payload.projectId, payload.title || revision.title);
-    let repository, created = false;
-    try { repository = await gh(repoPath(owner, name), settings.token); } catch (error) {
-      if (!/not found/i.test(error.message)) throw error;
+    const generatedName = generatedRepoName(payload.projectId, payload.title || revision.title);
+    const repoNames = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
+    let repository = await findExistingRepository(owner, settings.token, payload.projectId, repoNames), created = false;
+    const name = generatedName;
+    if (!repository) {
       repository = await gh('/user/repos', settings.token, { method:'POST', body:JSON.stringify({ name, description:`Websim backup for ${payload.title || payload.projectId}`, private:settings.visibility !== 'public', auto_init:false }), headers:{'Content-Type':'application/json'} }); created = true;
     }
-    return { owner, repo:repository.name || name, branch:mapped?.branch || branchName(settings, repository), defaultBranch:repository.default_branch || 'main', empty:repository.size === 0 || !repository.default_branch, created };
+    const mappedRepository = mapped?.repo && String(repository.name || name).toLowerCase() === String(mapped.repo).toLowerCase();
+    return { owner, repo:repository.name || name, branch:mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository), defaultBranch:repository.default_branch || 'main', empty:!repository.default_branch, created };
   }
   function b64(bytes) { let binary=''; for (let i=0;i<bytes.length;i+=0x8000) binary += String.fromCharCode(...bytes.subarray(i,i+0x8000)); return btoa(binary); }
   async function filesFor(id, version, revision) {
@@ -88,13 +115,6 @@
     await debugLog('git.bootstrap.start', { owner:target.owner, repo:target.repo, branch:target.branch, emptyRepository:Boolean(target.empty), fileCount:Object.keys(files).length });
     let parentSha = null;
     let branchExists = false;
-    if (target.empty) {
-      const seedPath = files['index.html'] ? 'index.html' : Object.keys(files)[0];
-      await debugLog('git.empty.seed.start', { owner:target.owner, repo:target.repo, branch:target.branch, path:seedPath });
-      const seed = await gh(`${base}/contents/${seedPath.split('/').map(encodeURIComponent).join('/')}`, settings.token, { method:'PUT', body:JSON.stringify({ message:'Initialize Websim repository', content:b64(files[seedPath]), branch:target.branch }), headers:{'Content-Type':'application/json'} });
-      await debugLog('git.empty.seed.complete', { owner:target.owner, repo:target.repo, branch:target.branch, commitSha:seed.commit?.sha || null });
-      target.empty = false;
-    }
     if (!target.empty) try { parentSha = (await gh(`${base}/git/ref/heads/${branch}`, settings.token)).object?.sha || null; branchExists = Boolean(parentSha); } catch (error) {
       if (!/not found|empty/i.test(error.message) && error.status !== 409) throw error;
       if (target.branch !== (target.defaultBranch || 'main')) { try { parentSha = (await gh(`${base}/git/ref/heads/${encodeURIComponent(target.defaultBranch || 'main')}`, settings.token)).object?.sha || null; } catch (fallback) { if (!/not found|empty/i.test(fallback.message) && fallback.status !== 409) throw fallback; } }
@@ -128,7 +148,7 @@
       return { ok:true, message:`${target.created ? 'Created repo and committed' : 'Committed'} v${result.version} to ${target.owner}/${target.repo} · ${target.branch}`, commit:result };
     } catch (error) { await debugLog('sync.failed', { stage, status:error.status || null, message:error.message }); throw error; }
   }
-  function notify(tabId, result) { if (tabId) api.tabs.sendMessage(tabId, { type:'SYNC_RESULT', ...result }).catch(() => {}); if (result.ok && api.notifications) api.notifications.create(`pin-${Date.now()}`, { type:'basic', title:'Pin to GitHub', message:result.message, iconUrl:api.runtime.getURL('icon.svg') }).catch(() => {}); }
+  function notify(tabId, result) { if (tabId) api.tabs.sendMessage(tabId, { type:'SYNC_RESULT', ...result }).catch(() => {}); if (result.ok && api.notifications) api.notifications.create(`pin-${Date.now()}`, { type:'basic', title:'Pin to GitHub', message:result.message, iconUrl:api.runtime.getURL('icon-128.png') }).catch(() => {}); }
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'GET_STATE') { config().then((state) => sendResponse({ ...state, token:'', hasToken:Boolean(state.token) })); return true; }
     if (message?.type === 'GET_LOGS') { config().then((state) => sendResponse({ logs:state.debugLogs || [] })); return true; }

@@ -165,6 +165,47 @@
     return settings.branchMode || 'main';
   }
 
+  async function findExistingRepository(owner, token, projectId, repoNames) {
+    for (const repoName of repoNames) {
+      try {
+        const repository = await githubRequest(repoPath(owner, repoName), token);
+        await debugLog('repository.resolve.found', {
+          owner,
+          repo: repository.name || repoName,
+          source: repoName === repoNames[0] ? 'project-map' : 'generated-name',
+          size: repository.size ?? null,
+          defaultBranch: repository.default_branch || null
+        });
+        return repository;
+      } catch (error) {
+        if (!/not found/i.test(error.message)) throw error;
+      }
+    }
+
+    for (let page = 1; page <= 10; page += 1) {
+      const repositories = await githubRequest(`/user/repos?per_page=100&page=${page}&sort=updated`, token);
+      const match = (Array.isArray(repositories) ? repositories : []).find((repository) => {
+        const name = String(repository.name || '').toLowerCase();
+        const projectSuffix = String(projectId || '').replace(/[^a-z0-9]/gi, '').slice(-8).toLowerCase();
+        return repoNames.some((candidate) => name === String(candidate).toLowerCase()) ||
+          (projectSuffix && name.endsWith(`-${projectSuffix}`) && name.startsWith('websim-')) ||
+          String(repository.description || '').includes(String(projectId || ''));
+      });
+      if (match) {
+        await debugLog('repository.resolve.found', {
+          owner,
+          repo: match.name,
+          source: 'repository-list',
+          size: match.size ?? null,
+          defaultBranch: match.default_branch || null
+        });
+        return match;
+      }
+      if (!Array.isArray(repositories) || repositories.length < 100) break;
+    }
+    return null;
+  }
+
   async function ensureRepository(payload, revision, settings) {
     await debugLog('repository.resolve.start', {
       projectId: payload.projectId,
@@ -173,19 +214,12 @@
     const user = await githubRequest('/user', settings.token);
     const owner = user.login;
     const mapped = settings.projectMap?.[payload.projectId];
-    const repoName = mapped?.repo || generatedRepoName(payload.projectId, payload.title || revision.title);
-    let repository;
+    const generatedName = generatedRepoName(payload.projectId, payload.title || revision.title);
+    const repoNames = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
+    let repository = await findExistingRepository(owner, settings.token, payload.projectId, repoNames);
     let created = false;
-    try {
-      repository = await githubRequest(repoPath(owner, repoName), settings.token);
-      await debugLog('repository.resolve.found', {
-        owner,
-        repo: repoName,
-        size: repository.size ?? null,
-        defaultBranch: repository.default_branch || null
-      });
-    } catch (error) {
-      if (!/not found|empty/i.test(error.message)) throw error;
+    const repoName = generatedName;
+    if (!repository) {
       repository = await githubRequest('/user/repos', settings.token, {
         method: 'POST',
         body: JSON.stringify({
@@ -203,12 +237,13 @@
         visibility: settings.visibility === 'public' ? 'public' : 'private'
       });
     }
+    const mappedRepository = mapped?.repo && String(repository.name || repoName).toLowerCase() === String(mapped.repo).toLowerCase();
     return {
       owner,
       repo: repository.name || repoName,
-      branch: mapped?.branch || branchName(settings, repository),
+      branch: mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository),
       defaultBranch: repository.default_branch || 'main',
-      empty: repository.size === 0 || !repository.default_branch,
+      empty: !repository.default_branch,
       created
     };
   }
@@ -241,21 +276,6 @@
     });
     let parentSha = null;
     let branchExists = false;
-    if (target.empty) {
-      const seedPath = files['index.html'] ? 'index.html' : Object.keys(files)[0];
-      await debugLog('git.empty.seed.start', { owner: target.owner, repo: target.repo, branch: target.branch, path: seedPath });
-      const seed = await githubRequest(`${basePath}/contents/${seedPath.split('/').map(encodeURIComponent).join('/')}`, settings.token, {
-        method: 'PUT',
-        body: JSON.stringify({
-          message: `Initialize Websim repository`,
-          content: toBase64(files[seedPath]),
-          branch: target.branch
-        }),
-        headers: { 'Content-Type': 'application/json' }
-      });
-      await debugLog('git.empty.seed.complete', { owner: target.owner, repo: target.repo, branch: target.branch, commitSha: seed.commit?.sha || null });
-      target.empty = false;
-    }
     if (!target.empty) {
       try {
         const ref = await githubRequest(`${basePath}/git/ref/heads/${branch}`, settings.token);
@@ -382,7 +402,7 @@
   async function notify(tabId, result) {
     if (tabId) api.tabs.sendMessage(tabId, { type: 'SYNC_RESULT', ...result }).catch(() => {});
     if (result.ok && api.notifications) {
-      api.notifications.create(`pin-${Date.now()}`, { type: 'basic', title: 'Pin to GitHub', message: result.message, iconUrl: api.runtime.getURL('icon.svg') }).catch(() => {});
+      api.notifications.create(`pin-${Date.now()}`, { type: 'basic', title: 'Pin to GitHub', message: result.message, iconUrl: api.runtime.getURL('icon-128.png') }).catch(() => {});
     }
   }
 

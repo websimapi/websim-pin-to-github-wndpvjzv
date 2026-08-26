@@ -46,17 +46,39 @@
     document.querySelector('#pin-to-github-toast')?.remove();
     const toast = document.createElement('div');
     toast.id = 'pin-to-github-toast';
-    toast.textContent = message;
+    if (kind === 'loading') {
+      const spinner = document.createElement('span');
+      spinner.className = 'pin-to-github-spinner';
+      const label = document.createElement('span');
+      label.textContent = message;
+      toast.append(spinner, label);
+    } else {
+      toast.textContent = message;
+    }
     toast.dataset.kind = kind;
     Object.assign(toast.style, {
       position: 'fixed', zIndex: '2147483647', right: '18px', bottom: '18px',
       maxWidth: 'min(360px, calc(100vw - 36px))', padding: '12px 15px',
       borderRadius: '9px', background: kind === 'error' ? '#3a1d24' : '#17221d',
       color: '#f4f1e8', border: `1px solid ${kind === 'error' ? '#d76b72' : '#b9df61'}`,
-      font: '500 13px/1.35 system-ui, sans-serif', boxShadow: '0 12px 30px rgba(0,0,0,.25)'
+      font: '500 13px/1.35 system-ui, sans-serif', boxShadow: '0 12px 30px rgba(0,0,0,.25)',
+      display: 'flex', alignItems: 'center', gap: '9px'
     });
+    if (kind === 'loading') {
+      Object.assign(toast.querySelector('.pin-to-github-spinner').style, {
+        width: '14px', height: '14px', flex: '0 0 14px', borderRadius: '50%',
+        border: '2px solid rgba(217,238,101,.3)', borderTopColor: '#d9ee65',
+        animation: 'pin-to-github-spin .75s linear infinite'
+      });
+      if (!document.querySelector('#pin-to-github-spinner-style')) {
+        const style = document.createElement('style');
+        style.id = 'pin-to-github-spinner-style';
+        style.textContent = '@keyframes pin-to-github-spin { to { transform: rotate(360deg); } }';
+        document.head.appendChild(style);
+      }
+    }
     document.documentElement.appendChild(toast);
-    window.setTimeout(() => toast.remove(), 6000);
+    if (kind !== 'loading') window.setTimeout(() => toast.remove(), 6000);
   }
 
   document.addEventListener('click', (event) => {
@@ -64,7 +86,10 @@
     if (!target || !looksLikePin(target) || Date.now() - lastPin < 1200) return;
     lastPin = Date.now();
     const payload = contextFor(target);
-    api.runtime.sendMessage({ type: 'PIN_DETECTED', payload }).catch(() => {});
+    showToast('Syncing revision to GitHub…', 'loading');
+    api.runtime.sendMessage({ type: 'PIN_DETECTED', payload }).catch(() => {
+      showToast('Pin to GitHub: extension background unavailable', 'error');
+    });
   }, true);
 
   api.runtime.onMessage.addListener((message) => {
