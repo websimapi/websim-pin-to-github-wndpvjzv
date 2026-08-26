@@ -407,7 +407,8 @@
   }
   async function saveSettings(message) {
     const stored = await config(), incoming = message.settings || {}, token = incoming.token || stored.token;
-    const tabId = normalizedTabId(message.tabId), projectId = await resolveProjectId(message), visibility = normalizedVisibility(incoming.visibility);
+    const tabId = normalizedTabId(message.tabId), projectId = await resolveProjectId(message), visibility = normalizedVisibility(incoming.visibility ?? visibilityForContext(stored, projectId, tabId));
+    await debugLog('settings.visibility.requested', { projectId, tabId, visibility });
     let owner = stored.owner || '', repository = null;
     if (token) owner = (await gh('/user', token)).login;
     if (projectId && token) {
@@ -421,7 +422,8 @@
         await debugLog('repository.visibility.updated', { projectId, tabId, owner, repo:repository.name, visibility });
       }
     }
-    const next = { ...stored, ...incoming, token, owner, visibility:normalizedVisibility(stored.visibility) };
+    // Keep project/tab overrides separate from the default for new projects.
+    const next = { ...stored, ...incoming, token, owner, visibility:projectId ? normalizedVisibility(stored.visibility) : visibility };
     if (projectId) next.visibilityByContext = { ...(stored.visibilityByContext || {}), [visibilityKey(projectId, tabId)]:visibility };
     else next.visibility = visibility;
     await storageSet(next);

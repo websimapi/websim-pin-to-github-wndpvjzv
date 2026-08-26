@@ -1083,7 +1083,8 @@
     const token = incoming.token || stored.token;
     const tabId = normalizedTabId(message.tabId);
     const projectId = await resolveProjectId(message);
-    const visibility = normalizedVisibility(incoming.visibility);
+    const visibility = normalizedVisibility(incoming.visibility ?? visibilityForContext(stored, projectId, tabId));
+    await debugLog('settings.visibility.requested', { projectId, tabId, visibility });
     let owner = stored.owner || '';
     let repository = null;
 
@@ -1124,7 +1125,9 @@
       ...incoming,
       token,
       owner,
-      visibility: normalizedVisibility(stored.visibility)
+      // A project/tab selection must not overwrite the default used by other
+      // projects, while a default selection must persist globally.
+      visibility: projectId ? normalizedVisibility(stored.visibility) : visibility
     };
     if (projectId) {
       next.visibilityByContext = {

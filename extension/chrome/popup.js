@@ -95,18 +95,34 @@ async function copyLogs() {
 
 $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const tokenInput = $('token').value.trim();
+  await saveSettings({ clearToken: true });
+});
+
+async function saveSettings({ clearToken = false } = {}) {
+  showMessage(clearToken ? 'Saving connection…' : 'Updating repository visibility…');
   const tab = await activeTab();
   const result = await send({ type: 'SAVE_SETTINGS', settings: {
-    token: tokenInput,
+    // Include a token typed into the popup so a first-time visibility change
+    // can save the connection and update the selected project in one action.
+    token: $('token').value.trim(),
     visibility: $('visibility').value,
     branchMode: $('branchMode').value,
     customBranch: $('customBranch').value.trim(),
     enabled: $('enabled').checked
   }, tabId: tab?.id, url: tab?.url, title: tab?.title });
-  if (result?.ok) { $('token').value = ''; showMessage(result.message || 'Saved locally.'); render(await stateForActiveTab()); refreshProjectLink(); }
-  else showMessage(result?.message || 'Could not validate this token.', true);
-});
+  if (result?.ok) {
+    if (clearToken) $('token').value = '';
+    showMessage(result.message || 'Saved locally.');
+    render(await stateForActiveTab());
+    refreshProjectLink();
+  } else {
+    showMessage(result?.message || 'Could not update repository visibility.', true);
+  }
+}
+
+// Visibility is project/tab-scoped, so apply it as soon as the active tab's
+// selection changes instead of requiring an unrelated form submission.
+$('visibility').addEventListener('change', () => saveSettings());
 
 $('branchMode').addEventListener('change', () => $('custom-branch-wrap').classList.toggle('hidden', $('branchMode').value !== 'custom'));
 $('advanced-logs').addEventListener('change', async () => {

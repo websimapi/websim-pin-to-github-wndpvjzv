@@ -51,12 +51,16 @@ async function copyLogs() {
 }
 $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const tokenInput = $('token').value.trim();
-  const tab = await activeTab();
-  const result = await send({ type:'SAVE_SETTINGS', settings:{ token:tokenInput, visibility:$('visibility').value, branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked }, tabId:tab?.id, url:tab?.url, title:tab?.title });
-  if (result?.ok) { $('token').value=''; message(result.message || 'Saved locally.'); render(await stateForActiveTab()); refreshProjectLink(); }
-  else message(result?.message || 'Could not validate this token.', true);
+  await saveSettings({ clearToken:true });
 });
+async function saveSettings({ clearToken = false } = {}) {
+  message(clearToken ? 'Saving connection…' : 'Updating repository visibility…');
+  const tab = await activeTab();
+  const result = await send({ type:'SAVE_SETTINGS', settings:{ token:$('token').value.trim(), visibility:$('visibility').value, branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked }, tabId:tab?.id, url:tab?.url, title:tab?.title });
+  if (result?.ok) { if (clearToken) $('token').value=''; message(result.message || 'Saved locally.'); render(await stateForActiveTab()); refreshProjectLink(); }
+  else message(result?.message || 'Could not update repository visibility.', true);
+}
+$('visibility').addEventListener('change', () => saveSettings());
 $('branchMode').addEventListener('change', () => $('custom-branch-wrap').classList.toggle('hidden', $('branchMode').value !== 'custom'));
 $('advanced-logs').addEventListener('change', async () => { const result = await send({ type:'SET_DEBUG_MODE', enabled:$('advanced-logs').checked }); if (result?.ok) message(result.advancedLogs ? 'Advanced logs enabled. Clear logs, then pin a project.' : 'Advanced logs disabled.'); else message('Could not update advanced logging.', true); });
 $('copy-logs').addEventListener('click', copyLogs);
