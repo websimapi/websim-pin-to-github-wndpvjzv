@@ -115,7 +115,7 @@
   function projectRevisionRead(value) {
     try {
       const url = new URL(value);
-      const match = url.pathname.match(/\/api\/v1\/projects\/([^/]+)\/revisions\/([^/]+)/i);
+      const match = url.pathname.match(/\/api\/v1\/projects\/([^/]+)\/revisions\/([^/]+)\/assets$/i);
       return match ? { projectId: decodeURIComponent(match[1]), version: decodeURIComponent(match[2]) } : null;
     } catch {
       return null;
@@ -196,7 +196,8 @@
 
   function projectMutationState(data) {
     const project = data?.project || data?.site || data || {};
-    const revision = data?.project_revision || data?.revision || {};
+    const revision = data?.project_revision || data?.revision ||
+      project.current_revision || project.currentRevision || project.revision || {};
     const fields = Object.fromEntries(
       [...mutationStateEntries(project), ...mutationStateEntries(revision)]
         .sort(([a], [b]) => a.localeCompare(b))
@@ -341,7 +342,10 @@
     if (projectIdForLog(entry, projectMap) !== String(projectId || '')) return false;
     const entryTabId = normalizedTabId(entry?.tabId);
     const activeTabId = normalizedTabId(tabId);
-    return entryTabId === null || activeTabId === null || entryTabId === activeTabId;
+    // Once the popup identifies an active tab, only show entries recorded by
+    // that tab. Entries without a tab scope are intentionally hidden here so
+    // diagnostics from another tab cannot bleed into the current page.
+    return activeTabId === null ? true : entryTabId === activeTabId;
   }
 
   function logsForProject(logs, projectId, tabId, projectMap) {
@@ -379,6 +383,20 @@
     });
   }
 
+  function projectReadiness(data) {
+    const project = data?.project || data?.site || data || {};
+    const revision = data?.project_revision || data?.revision ||
+      project.current_revision || project.currentRevision || project.revision || {};
+    return {
+      project,
+      revision,
+      version: project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null,
+      ready: Boolean(String(project.slug || '').trim()) &&
+        (project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number) !== null &&
+        revision.draft !== true
+    };
+  }
+
   async function autoSyncNewProject(payload, tabId) {
     const settings = await config();
     if (!settings.enabled || !settings.token) return { ok: true, skipped: 'not-configured' };
@@ -397,10 +415,8 @@
     try {
       const linked = settings.projectMap?.[projectId];
       const projectResponse = await wsJson(`/projects/${encodeURIComponent(projectId)}`);
-      const project = projectResponse?.project || projectResponse?.site || projectResponse || {};
-      const revision = projectResponse?.project_revision || projectResponse?.revision || {};
-      const version = project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
-      if (!String(project.slug || '').trim() || version === null || revision.draft === true) {
+      const { project, revision, version, ready } = projectReadiness(projectResponse);
+      if (!ready) {
         await debugLog('sync.page-ready.skipped', {
           projectId,
           tabId: normalizedTabId(tabId),
@@ -578,7 +594,7 @@
       repo: repository.name || repoName,
       branch: mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository),
       defaultBranch: repository.default_branch || 'main',
-      empty: !repository.default_branch,
+      empty: repository.size === 0 || !repository.default_branch,
       created
     };
   }
@@ -783,7 +799,7 @@
       await debugLog('sync.blocked', { reason: 'auto-sync-disabled' });
       throw new Error('Auto-sync is paused in the extension popup');
     }
-    if (!settings.token) {
+      if (!settings.token) {
       await debugLog('sync.blocked', { reason: 'github-token-missing' });
       throw new Error('Open the extension popup and finish GitHub setup');
     }
@@ -802,6 +818,17 @@
       syncInFlight.add(runKey);
       activeSyncs.add(runKey);
       setSyncIndicator(true, tabId);
+      const readiness = projectReadiness(await wsJson(`/projects/${encodeURIComponent(projectId)}`));
+      if (!readiness.ready) {
+        await debugLog('sync.skipped', {
+          projectId,
+          reason: 'project-not-ready',
+          slug: readiness.project.slug || null,
+          version: readiness.version,
+          draft: readiness.revision.draft ?? null
+        });
+        return { ok: true, skipped: 'project-not-ready', message: 'Websim has not finalized this draft revision yet' };
+      }
       stage = 'fetch-current-revision';
       const { version, revision } = await currentRevision(projectId);
       await debugLog('websim.revision.selected', { projectId, version });

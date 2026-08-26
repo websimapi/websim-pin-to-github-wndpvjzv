@@ -35,8 +35,7 @@
   function safeDebugDetail(detail = {}) { return Object.fromEntries(Object.entries(detail).slice(0,24).map(([key,value]) => { if (typeof value === 'string') return [key,value.replace(/([?&](?:token|access_token|authorization|code|key)=)[^&]*/gi,'$1[redacted]').slice(0,400)]; if (typeof value === 'number' || typeof value === 'boolean' || value === null) return [key,value]; return [key,String(value).slice(0,400)]; })); }
   function websimNetworkUrl(value) { try { const url = new URL(value); if (!/(^|\.)websim\.com$/i.test(url.hostname)) return null; if (!/\/api\//i.test(url.pathname) && !/(pin|pinned|bookmark|collection|save)/i.test(url.pathname)) return null; return `${url.origin}${url.pathname}`; } catch { return null; } }
   function projectMutation(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v1\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
-  function projectRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v[12]\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
-  function projectRevisionRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v1\/projects\/([^/]+)\/revisions\/([^/]+)/i); return match ? { projectId:decodeURIComponent(match[1]), version:decodeURIComponent(match[2]) } : null; } catch { return null; } }
+  function projectRevisionRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v1\/projects\/([^/]+)\/revisions\/([^/]+)\/assets$/i); return match ? { projectId:decodeURIComponent(match[1]), version:decodeURIComponent(match[2]) } : null; } catch { return null; } }
   function projectActivityRead(value) { return projectRead(value) || projectRevisionRead(value); }
   function projectRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v[12]\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
   function decodeRequestBytes(bytes) { try { if (!bytes) return ''; if (Array.isArray(bytes)) return new TextDecoder().decode(new Uint8Array(bytes)); return new TextDecoder().decode(bytes); } catch { return ''; } }
@@ -59,7 +58,9 @@
   }
   function mutationStateEntries(value, prefix = '', depth = 0) { if (!value || typeof value !== 'object' || depth > 3) return []; return Object.entries(value).flatMap(([key, child]) => { const path = prefix ? `${prefix}.${key}` : key; if (/pin|bookmark|version|revision/i.test(key)) return [[path, child]]; if (child && typeof child === 'object' && !Array.isArray(child)) return mutationStateEntries(child, path, depth + 1); return []; }); }
   function projectMutationState(data) {
-    const project = data?.project || data?.site || data || {}, revision = data?.project_revision || data?.revision || {};
+    const project = data?.project || data?.site || data || {};
+    const revision = data?.project_revision || data?.revision ||
+      project.current_revision || project.currentRevision || project.revision || {};
     const fields = Object.fromEntries([...mutationStateEntries(project), ...mutationStateEntries(revision)].sort(([a],[b]) => a.localeCompare(b)));
     return { version:project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null, fingerprint:JSON.stringify(fields) };
   }
@@ -150,7 +151,15 @@
     const repo=decodeURIComponent(repoMatch[1]).toLowerCase();
     return Object.entries(projectMap).find(([,mapped]) => String(mapped?.repo || '').toLowerCase() === repo)?.[0] || null;
   }
-  function belongsToContext(entry, projectId, tabId, projectMap) { if (projectIdForLog(entry, projectMap) !== String(projectId || '')) return false; const entryTabId=normalizedTabId(entry?.tabId), activeTabId=normalizedTabId(tabId); return entryTabId === null || activeTabId === null || entryTabId === activeTabId; }
+  function belongsToContext(entry, projectId, tabId, projectMap) {
+    if (projectIdForLog(entry, projectMap) !== String(projectId || '')) return false;
+    const entryTabId = normalizedTabId(entry?.tabId);
+    const activeTabId = normalizedTabId(tabId);
+    // Once the popup identifies an active tab, only show entries recorded by
+    // that tab. Entries without a tab scope are intentionally hidden here so
+    // diagnostics from another tab cannot bleed into the current page.
+    return activeTabId === null ? true : entryTabId === activeTabId;
+  }
   function logsForProject(logs, projectId, tabId, projectMap) { if (!projectId) return []; return (logs || []).filter((entry) => belongsToContext(entry, projectId, tabId, projectMap)); }
   function eventsForProject(events, projectId, tabId) { if (!projectId) return []; return (events || []).filter((entry) => belongsToContext(entry, projectId, tabId, {})); }
   async function stateForContext(message = {}) {
@@ -161,6 +170,13 @@
     const stored=await config(), projectId=await resolveProjectId(message); if (!projectId) return;
     const tabId=normalizedTabId(message.tabId);
     await storageSet({ debugLogs:(stored.debugLogs || []).filter((entry) => !belongsToContext(entry, projectId, tabId, stored.projectMap)) });
+  }
+  function projectReadiness(data) {
+    const project=data?.project || data?.site || data || {};
+    const revision=data?.project_revision || data?.revision ||
+      project.current_revision || project.currentRevision || project.revision || {};
+    const version=project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
+    return { project, revision, version, ready:Boolean(String(project.slug || '').trim()) && version !== null && revision.draft !== true };
   }
   async function autoSyncNewProject(payload, tabId) {
     const settings=await config(); if (!settings.enabled || !settings.token) return { ok:true, skipped:'not-configured' };
@@ -174,9 +190,8 @@
     automaticSyncChecks.add(checkKey);
     try {
       const projectResponse=await wsJson(`/projects/${encodeURIComponent(projectId)}`);
-      const project=projectResponse?.project || projectResponse?.site || projectResponse || {}, revision=projectResponse?.project_revision || projectResponse?.revision || {};
-      const version=project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
-      if (!String(project.slug || '').trim() || version === null || revision.draft === true) {
+      const { project, revision, version, ready }=projectReadiness(projectResponse);
+      if (!ready) {
         await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'project-not-ready', slug:project.slug || null, version, draft:revision.draft ?? null });
         return { ok:true, skipped:'project-not-ready', projectId };
       }
@@ -205,7 +220,7 @@
       repository = await gh('/user/repos', settings.token, { method:'POST', body:JSON.stringify({ name, description:`Websim backup for ${payload.title || payload.projectId}`, private:settings.visibility !== 'public', auto_init:false }), headers:{'Content-Type':'application/json'} }); created = true;
     }
     const mappedRepository = mapped?.repo && String(repository.name || name).toLowerCase() === String(mapped.repo).toLowerCase();
-    return { owner, repo:repository.name || name, branch:mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository), defaultBranch:repository.default_branch || 'main', empty:!repository.default_branch, created };
+    return { owner, repo:repository.name || name, branch:mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository), defaultBranch:repository.default_branch || 'main', empty:repository.size === 0 || !repository.default_branch, created };
   }
   function b64(bytes) { let binary=''; for (let i=0;i<bytes.length;i+=0x8000) binary += String.fromCharCode(...bytes.subarray(i,i+0x8000)); return btoa(binary); }
   async function filesFor(id, version, revision) {
@@ -290,6 +305,11 @@
       syncInFlight.add(runKey);
       activeSyncs.add(runKey);
       setSyncIndicator(true, tabId);
+      const readiness=projectReadiness(await wsJson(`/projects/${encodeURIComponent(projectId)}`));
+      if (!readiness.ready) {
+        await debugLog('sync.skipped', { projectId, reason:'project-not-ready', slug:readiness.project.slug || null, version:readiness.version, draft:readiness.revision.draft ?? null });
+        return { ok:true, skipped:'project-not-ready', message:'Websim has not finalized this draft revision yet' };
+      }
       stage = 'fetch-current-revision';
       const { version, revision } = await currentRevision(projectId); await debugLog('websim.revision.selected', { projectId, version });
       stage = 'resolve-or-create-repository';
