@@ -396,11 +396,10 @@
       revision,
       version,
       hasSlug,
-      // Websim can finalize v2 before its slug is populated. v1 drafts are
-      // still held back, while finalized revisions can use the title/ID
-      // fallback until the canonical slug arrives.
-      ready: version !== null && revision.draft !== true &&
-        (hasSlug || Number(version) >= 2)
+      // A revision is eligible only after Websim has assigned its canonical
+      // slug. This prevents v1 drafts and slug-less v2 revisions from being
+      // committed to a temporary ID/title-based repository.
+      ready: hasSlug && version !== null && revision.draft !== true
     };
   }
 
@@ -482,7 +481,6 @@
           tabId: normalizedTabId(tabId),
           reason: 'project-not-ready',
           slug: project.slug || null,
-          slugFallback: ready ? (project.slug ? null : 'title-or-project-id') : null,
           version,
           draft: revision.draft ?? null
         });
@@ -490,6 +488,12 @@
         return { ok: true, skipped: 'project-not-ready', projectId };
       }
       cancelReadinessRetry(projectId, tabId);
+      await debugLog('sync.page-ready.ready', {
+        projectId,
+        tabId: normalizedTabId(tabId),
+        slug: project.slug,
+        version
+      });
       if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) {
         await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'version-already-synced', version });
         cancelReadinessRetry(projectId, tabId);

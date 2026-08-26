@@ -53,5 +53,17 @@
     if (message?.type === 'SYNC_RESULT') { debug('content.sync.result', { ok:Boolean(message.ok), message:message.message || null }); showToast(message.ok ? `✓ ${message.message}` : `Pin to GitHub: ${message.message}`, message.ok ? 'success' : 'error'); }
   });
   debug('content.ready', { page:location.href.split(/[?#]/)[0], isFrame:window.top !== window.self, pinCandidates:[...document.querySelectorAll('button,a,[role="button"]')].filter(looksLikePin).slice(0,12).map(targetSummary) });
-  window.setTimeout(() => { const payload=pageReadyContext(); if (!payload) return; api.runtime.sendMessage({ type:'PROJECT_PAGE_READY', payload }).then((result) => { if (!result?.skipped) debug('content.page-ready.response', { ok:Boolean(result?.ok), message:result?.message || null }); }).catch((error) => debug('content.page-ready.error', { message:error.message })); }, 250);
+  const pageReadyRetryDelays=[1000,2000,4000,8000,15000,30000,60000];
+  function requestPageReady(payload, attempt=0) {
+    api.runtime.sendMessage({ type:'PROJECT_PAGE_READY', payload }).then((result) => {
+      const retryable=result?.skipped === 'project-not-ready' || result?.skipped === 'project-not-found', delay=pageReadyRetryDelays[attempt];
+      if (retryable && window.top === window.self && delay !== undefined) {
+        debug('content.page-ready.retry', { attempt:attempt + 1, delayMs:delay, reason:result.skipped });
+        window.setTimeout(() => requestPageReady(payload, attempt + 1), delay);
+        return;
+      }
+      if (!result?.skipped) debug('content.page-ready.response', { ok:Boolean(result?.ok), message:result?.message || null });
+    }).catch((error) => debug('content.page-ready.error', { message:error.message }));
+  }
+  window.setTimeout(() => { const payload=pageReadyContext(); if (payload) requestPageReady(payload); }, 250);
 })();

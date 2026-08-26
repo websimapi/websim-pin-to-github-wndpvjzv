@@ -179,7 +179,7 @@
       project.current_revision || project.currentRevision || project.revision || {};
     const version=project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
     const hasSlug=Boolean(String(project.slug || '').trim());
-    return { project, revision, version, hasSlug, ready:version !== null && revision.draft !== true && (hasSlug || Number(version) >= 2) };
+    return { project, revision, version, hasSlug, ready:hasSlug && version !== null && revision.draft !== true };
   }
   function readinessRetryKey(projectId, tabId) { return syncKey(projectId, tabId); }
   function cancelReadinessRetry(projectId, tabId) {
@@ -221,6 +221,7 @@
         return { ok:true, skipped:'project-not-ready', projectId };
       }
       cancelReadinessRetry(projectId, tabId);
+      await debugLog('sync.page-ready.ready', { projectId, tabId:normalizedTabId(tabId), slug:project.slug, version });
       const linked=settings.projectMap?.[projectId];
       if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'version-already-synced', version }); cancelReadinessRetry(projectId, tabId); return { ok:true, skipped:'version-already-synced', projectId }; }
       const readyPayload={ ...payload, projectId, title:payload.title || project.title || null, slug:project.slug || null };
