@@ -16,6 +16,7 @@
   const activeSyncs = new Set();
   const projectLogScopes = new Map();
   const repoLogScopes = new Map();
+  const automaticSyncChecks = new Set();
 
   function normalizedTabId(tabId) {
     return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
@@ -95,6 +96,16 @@
     try {
       const url = new URL(value);
       const match = url.pathname.match(/\/api\/v1\/projects\/([^/]+)$/i);
+      return match ? { projectId: decodeURIComponent(match[1]) } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function projectRead(value) {
+    try {
+      const url = new URL(value);
+      const match = url.pathname.match(/\/api\/v[12]\/projects\/([^/]+)$/i);
       return match ? { projectId: decodeURIComponent(match[1]) } : null;
     } catch {
       return null;
@@ -365,14 +376,25 @@
       }
     }
     if (!projectId) return { ok: true, skipped: 'project-not-found' };
-    if (settings.projectMap?.[projectId]) {
-      await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'project-already-linked' });
-      return { ok: true, skipped: 'project-already-linked', projectId };
+    const checkKey = syncKey(projectId, tabId);
+    if (automaticSyncChecks.has(checkKey)) return { ok: true, skipped: 'check-in-progress', projectId };
+    automaticSyncChecks.add(checkKey);
+    try {
+      const linked = settings.projectMap?.[projectId];
+      if (linked) {
+        const { version } = await currentRevision(projectId);
+        if (String(knownSyncedVersion(settings, projectId)) === String(version)) {
+          await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'version-already-synced', version });
+          return { ok: true, skipped: 'version-already-synced', projectId };
+        }
+      }
+      rememberProjectLogScope(projectId, tabId);
+      setSyncIndicator(true, tabId);
+      if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type: 'SYNC_STARTED', source: 'project-page-ready' }).catch(() => {});
+      return await sync({ ...payload, projectId }, tabId);
+    } finally {
+      automaticSyncChecks.delete(checkKey);
     }
-    rememberProjectLogScope(projectId, tabId);
-    setSyncIndicator(true, tabId);
-    if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type: 'SYNC_STARTED', source: 'project-page-ready' }).catch(() => {});
-    return sync({ ...payload, projectId }, tabId);
   }
 
   async function currentRevision(projectId) {
@@ -830,10 +852,19 @@
         if (!url) return;
         const mutation = details.method === 'PATCH' ? projectMutation(details.url) : null;
         const body = requestBodySummary(details.requestBody);
+        const tabId = normalizedTabId(details.tabId);
+        const read = details.method === 'GET' ? projectRead(details.url) : null;
         if (mutation) {
           const beforeState = readProjectMutationState(mutation.projectId);
           trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId: details.tabId });
           debugLog('pin.candidate.request', { tabId: details.tabId, projectId: mutation.projectId, method: details.method, body });
+        }
+        if (read && tabId !== null) {
+          autoSyncNewProject({ projectId: read.projectId, url: details.documentUrl || details.url, title: null }, tabId).then((result) => {
+            if (!result?.skipped) notify(tabId, result);
+          }).catch((error) => {
+            debugLog('sync.page-ready.failed', { tabId, projectId: read.projectId, message: error.message });
+          });
         }
         config().then((state) => state.advancedLogs && debugLog('network.request', {
           requestId: details.requestId,

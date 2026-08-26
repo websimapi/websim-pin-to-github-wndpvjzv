@@ -10,6 +10,7 @@
   const activeSyncs = new Set();
   const projectLogScopes = new Map();
   const repoLogScopes = new Map();
+  const automaticSyncChecks = new Set();
   function normalizedTabId(tabId) { return Number.isInteger(tabId) && tabId >= 0 ? tabId : null; }
   function syncKey(projectId, tabId) { const scope = normalizedTabId(tabId); return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`; }
   function activeSyncForTab(tabId) { const scope = normalizedTabId(tabId), prefix = `${scope === null ? 'background' : `tab:${scope}`}:`; return [...activeSyncs].some((key) => key.startsWith(prefix)); }
@@ -34,6 +35,7 @@
   function safeDebugDetail(detail = {}) { return Object.fromEntries(Object.entries(detail).slice(0,24).map(([key,value]) => { if (typeof value === 'string') return [key,value.replace(/([?&](?:token|access_token|authorization|code|key)=)[^&]*/gi,'$1[redacted]').slice(0,400)]; if (typeof value === 'number' || typeof value === 'boolean' || value === null) return [key,value]; return [key,String(value).slice(0,400)]; })); }
   function websimNetworkUrl(value) { try { const url = new URL(value); if (!/(^|\.)websim\.com$/i.test(url.hostname)) return null; if (!/\/api\//i.test(url.pathname) && !/(pin|pinned|bookmark|collection|save)/i.test(url.pathname)) return null; return `${url.origin}${url.pathname}`; } catch { return null; } }
   function projectMutation(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v1\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
+  function projectRead(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v[12]\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
   function decodeRequestBytes(bytes) { try { if (!bytes) return ''; if (Array.isArray(bytes)) return new TextDecoder().decode(new Uint8Array(bytes)); return new TextDecoder().decode(bytes); } catch { return ''; } }
   function requestFieldEntries(value, prefix = '', depth = 0) { if (!value || typeof value !== 'object' || depth > 3) return []; return Object.entries(value).flatMap(([key, child]) => { const path = prefix ? `${prefix}.${key}` : key; if (child && typeof child === 'object') { if (Array.isArray(child)) return [[path, `[${child.length} items]`]]; return requestFieldEntries(child, path, depth + 1); } return [[path, child]]; }); }
   function requestBodySummary(body) {
@@ -165,10 +167,18 @@
       if (!projectId && attempt<2) { await debugLog('sync.page-ready.retry', { tabId:normalizedTabId(tabId), attempt:attempt + 1, reason:'project-not-found' }); await new Promise((resolve) => setTimeout(resolve,500)); }
     }
     if (!projectId) return { ok:true, skipped:'project-not-found' };
-    if (settings.projectMap?.[projectId]) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'project-already-linked' }); return { ok:true, skipped:'project-already-linked', projectId }; }
-    rememberProjectLogScope(projectId, tabId); setSyncIndicator(true, tabId);
-    if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type:'SYNC_STARTED', source:'project-page-ready' }).catch(() => {});
-    return sync({ ...payload, projectId }, tabId);
+    const checkKey=syncKey(projectId, tabId); if (automaticSyncChecks.has(checkKey)) return { ok:true, skipped:'check-in-progress', projectId };
+    automaticSyncChecks.add(checkKey);
+    try {
+      const linked=settings.projectMap?.[projectId];
+      if (linked) {
+        const { version } = await currentRevision(projectId);
+        if (String(knownSyncedVersion(settings, projectId)) === String(version)) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'version-already-synced', version }); return { ok:true, skipped:'version-already-synced', projectId }; }
+      }
+      rememberProjectLogScope(projectId, tabId); setSyncIndicator(true, tabId);
+      if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type:'SYNC_STARTED', source:'project-page-ready' }).catch(() => {});
+      return await sync({ ...payload, projectId }, tabId);
+    } finally { automaticSyncChecks.delete(checkKey); }
   }
   async function currentRevision(id) {
     let project = {}; try { project = await wsJson(`/projects/${encodeURIComponent(id)}`); } catch {}
@@ -295,7 +305,14 @@
   if (api.webRequest?.onBeforeRequest) {
     const requestFilter = { urls:['https://websim.com/*','https://*.websim.com/*'] };
     try {
-      api.webRequest.onBeforeRequest.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const mutation=details.method === 'PATCH' ? projectMutation(details.url) : null, body=requestBodySummary(details.requestBody); if (mutation) { const beforeState=readProjectMutationState(mutation.projectId); trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId:details.tabId }); debugLog('pin.candidate.request', { tabId:details.tabId, projectId:mutation.projectId, method:details.method, body }); } config().then((state) => state.advancedLogs && debugLog('network.request', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), method:details.method, type:details.type, url, ...(mutation ? { projectId:mutation.projectId, body } : {}) })); }, requestFilter, ['requestBody']);
+      api.webRequest.onBeforeRequest.addListener((details) => {
+        const url=websimNetworkUrl(details.url); if (!url) return;
+        const mutation=details.method === 'PATCH' ? projectMutation(details.url) : null, body=requestBodySummary(details.requestBody);
+        const tabId=normalizedTabId(details.tabId), read=details.method === 'GET' ? projectRead(details.url) : null;
+        if (mutation) { const beforeState=readProjectMutationState(mutation.projectId); trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId:details.tabId }); debugLog('pin.candidate.request', { tabId:details.tabId, projectId:mutation.projectId, method:details.method, body }); }
+        if (read && tabId !== null) autoSyncNewProject({ projectId:read.projectId, url:details.documentUrl || details.url, title:null }, tabId).then((result) => { if (!result?.skipped) notify(tabId,result); }).catch((error) => debugLog('sync.page-ready.failed', { tabId, projectId:read.projectId, message:error.message }));
+        config().then((state) => state.advancedLogs && debugLog('network.request', { requestId:details.requestId, tabId, method:details.method, type:details.type, url, ...(mutation ? { projectId:mutation.projectId, body } : {}) }));
+      }, requestFilter, ['requestBody']);
       api.webRequest.onCompleted?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); Promise.resolve(tracked.beforeState).then((beforeState) => triggerAutoSync(details, tracked.mutation, tracked.body, beforeState)).catch((error) => debugLog('pin.autosync.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, message:error.message })); } config().then((state) => state.advancedLogs && debugLog('network.response', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), status:details.statusCode, type:details.type, url })); }, requestFilter);
       api.webRequest.onErrorOccurred?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); debugLog('pin.candidate.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, error:details.error, body:tracked.body }); } config().then((state) => state.advancedLogs && debugLog('network.error', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), error:details.error, type:details.type, url })); }, requestFilter);
       debugLog('network.monitor.ready', { watches:['PATCH /api/v1/projects/{id}', 'Websim API requests'] });
