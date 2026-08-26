@@ -12,7 +12,10 @@
   const repoLogScopes = new Map();
   const automaticSyncChecks = new Set();
   const readinessRetryTimers = new Map();
-  const readinessRetryDelays = [1000, 2000, 4000, 8000, 15000, 30000, 60000];
+  // Slug assignment normally follows the first project/revision request by
+  // only a few seconds. Keep the fallback poll responsive so a slow request
+  // does not strand the sync behind a 30–60 second gap.
+  const readinessRetryDelays = [500, 1000, 2000, 3000, 5000, 8000, 12000, 20000];
   function normalizedTabId(tabId) { return Number.isInteger(tabId) && tabId >= 0 ? tabId : null; }
   function syncKey(projectId, tabId) { const scope = normalizedTabId(tabId); return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`; }
   function activeSyncForTab(tabId) { const scope = normalizedTabId(tabId), prefix = `${scope === null ? 'background' : `tab:${scope}`}:`; return [...activeSyncs].some((key) => key.startsWith(prefix)); }
@@ -381,12 +384,11 @@
       api.webRequest.onBeforeRequest.addListener((details) => {
         const url=websimNetworkUrl(details.url); if (!url) return;
         const mutation=details.method === 'PATCH' ? projectMutation(details.url) : null, body=requestBodySummary(details.requestBody);
-        const tabId=normalizedTabId(details.tabId), read=details.method === 'GET' ? projectActivityRead(details.url) : null;
+        const tabId=normalizedTabId(details.tabId);
         if (mutation) { const beforeState=readProjectMutationState(mutation.projectId); trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId:details.tabId }); debugLog('pin.candidate.request', { tabId:details.tabId, projectId:mutation.projectId, method:details.method, body }); }
-        if (read && tabId !== null) autoSyncNewProject({ projectId:read.projectId, url:details.documentUrl || details.url, title:null }, tabId).then((result) => { if (!result?.skipped) notify(tabId,result); }).catch((error) => debugLog('sync.page-ready.failed', { tabId, projectId:read.projectId, message:error.message }));
         config().then((state) => state.advancedLogs && debugLog('network.request', { requestId:details.requestId, tabId, method:details.method, type:details.type, url, ...(mutation ? { projectId:mutation.projectId, body } : {}) }));
       }, requestFilter, ['requestBody']);
-      api.webRequest.onCompleted?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); Promise.resolve(tracked.beforeState).then((beforeState) => triggerAutoSync(details, tracked.mutation, tracked.body, beforeState)).catch((error) => debugLog('pin.autosync.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, message:error.message })); } config().then((state) => state.advancedLogs && debugLog('network.response', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), status:details.statusCode, type:details.type, url })); }, requestFilter);
+      api.webRequest.onCompleted?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const read=details.method === 'GET' ? projectActivityRead(details.url) : null, tabId=normalizedTabId(details.tabId); if (read && tabId !== null) autoSyncNewProject({ projectId:read.projectId, url:details.documentUrl || details.url, title:null }, tabId).then((result) => { if (!result?.skipped) notify(tabId,result); }).catch((error) => debugLog('sync.page-ready.failed', { tabId, projectId:read.projectId, message:error.message })); const tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); Promise.resolve(tracked.beforeState).then((beforeState) => triggerAutoSync(details, tracked.mutation, tracked.body, beforeState)).catch((error) => debugLog('pin.autosync.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, message:error.message })); } config().then((state) => state.advancedLogs && debugLog('network.response', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), status:details.statusCode, type:details.type, url })); }, requestFilter);
       api.webRequest.onErrorOccurred?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); debugLog('pin.candidate.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, error:details.error, body:tracked.body }); } config().then((state) => state.advancedLogs && debugLog('network.error', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), error:details.error, type:details.type, url })); }, requestFilter);
       debugLog('network.monitor.ready', { watches:['PATCH /api/v1/projects/{id}', 'Websim API requests'] });
     } catch (error) { debugLog('network.monitor.unavailable', { message:error.message }); }

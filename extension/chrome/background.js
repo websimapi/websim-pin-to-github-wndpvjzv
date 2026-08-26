@@ -18,7 +18,10 @@
   const repoLogScopes = new Map();
   const automaticSyncChecks = new Set();
   const readinessRetryTimers = new Map();
-  const readinessRetryDelays = [1000, 2000, 4000, 8000, 15000, 30000, 60000];
+  // Slug assignment normally follows the first project/revision request by
+  // only a few seconds. Keep the fallback poll responsive so a slow request
+  // does not strand the sync behind a 30–60 second gap.
+  const readinessRetryDelays = [500, 1000, 2000, 3000, 5000, 8000, 12000, 20000];
 
   function normalizedTabId(tabId) {
     return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
@@ -1037,18 +1040,10 @@
         const mutation = details.method === 'PATCH' ? projectMutation(details.url) : null;
         const body = requestBodySummary(details.requestBody);
         const tabId = normalizedTabId(details.tabId);
-        const read = details.method === 'GET' ? projectActivityRead(details.url) : null;
         if (mutation) {
           const beforeState = readProjectMutationState(mutation.projectId);
           trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId: details.tabId });
           debugLog('pin.candidate.request', { tabId: details.tabId, projectId: mutation.projectId, method: details.method, body });
-        }
-        if (read && tabId !== null) {
-          autoSyncNewProject({ projectId: read.projectId, url: details.documentUrl || details.url, title: null }, tabId).then((result) => {
-            if (!result?.skipped) notify(tabId, result);
-          }).catch((error) => {
-            debugLog('sync.page-ready.failed', { tabId, projectId: read.projectId, message: error.message });
-          });
         }
         config().then((state) => state.advancedLogs && debugLog('network.request', {
           requestId: details.requestId,
@@ -1062,6 +1057,17 @@
       api.webRequest.onCompleted?.addListener((details) => {
         const url = websimNetworkUrl(details.url);
         if (!url) return;
+        const read = details.method === 'GET' ? projectActivityRead(details.url) : null;
+        const tabId = normalizedTabId(details.tabId);
+        // Check after Websim has finished its request. A check started from
+        // onBeforeRequest can only observe the previous, slug-less state.
+        if (read && tabId !== null) {
+          autoSyncNewProject({ projectId: read.projectId, url: details.documentUrl || details.url, title: null }, tabId).then((result) => {
+            if (!result?.skipped) notify(tabId, result);
+          }).catch((error) => {
+            debugLog('sync.page-ready.failed', { tabId, projectId: read.projectId, message: error.message });
+          });
+        }
         const tracked = trackedWebsimRequests.get(requestKey(details));
         if (tracked) {
           trackedWebsimRequests.delete(requestKey(details));

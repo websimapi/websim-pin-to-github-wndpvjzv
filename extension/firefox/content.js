@@ -53,7 +53,7 @@
     if (message?.type === 'SYNC_RESULT') { debug('content.sync.result', { ok:Boolean(message.ok), message:message.message || null }); showToast(message.ok ? `✓ ${message.message}` : `Pin to GitHub: ${message.message}`, message.ok ? 'success' : 'error'); }
   });
   debug('content.ready', { page:location.href.split(/[?#]/)[0], isFrame:window.top !== window.self, pinCandidates:[...document.querySelectorAll('button,a,[role="button"]')].filter(looksLikePin).slice(0,12).map(targetSummary) });
-  const pageReadyRetryDelays=[1000,2000,4000,8000,15000,30000,60000];
+  const pageReadyRetryDelays=[500,1000,2000,3000,5000,8000,12000,20000];
   function requestPageReady(payload, attempt=0) {
     api.runtime.sendMessage({ type:'PROJECT_PAGE_READY', payload }).then((result) => {
       const retryable=result?.skipped === 'project-not-ready' || result?.skipped === 'project-not-found', delay=pageReadyRetryDelays[attempt];
