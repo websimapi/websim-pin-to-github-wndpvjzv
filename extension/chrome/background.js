@@ -389,13 +389,18 @@
     const project = data?.project || data?.site || data || {};
     const revision = data?.project_revision || data?.revision ||
       project.current_revision || project.currentRevision || project.revision || {};
+    const version = project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
+    const hasSlug = Boolean(String(project.slug || '').trim());
     return {
       project,
       revision,
-      version: project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null,
-      ready: Boolean(String(project.slug || '').trim()) &&
-        (project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number) !== null &&
-        revision.draft !== true
+      version,
+      hasSlug,
+      // Websim can finalize v2 before its slug is populated. v1 drafts are
+      // still held back, while finalized revisions can use the title/ID
+      // fallback until the canonical slug arrives.
+      ready: version !== null && revision.draft !== true &&
+        (hasSlug || Number(version) >= 2)
     };
   }
 
@@ -477,6 +482,7 @@
           tabId: normalizedTabId(tabId),
           reason: 'project-not-ready',
           slug: project.slug || null,
+          slugFallback: ready ? (project.slug ? null : 'title-or-project-id') : null,
           version,
           draft: revision.draft ?? null
         });
@@ -877,7 +883,12 @@
       const runKey = syncKey(projectId, tabId);
       if (syncInFlight.has(runKey)) {
         await debugLog('sync.skipped-in-flight', { projectId, tabId: normalizedTabId(tabId) });
-        return { ok: true, inProgress: true, message: 'A sync for this project is already in progress' };
+        return {
+          ok: true,
+          inProgress: true,
+          skipped: 'in-progress',
+          message: 'This project is already being synced'
+        };
       }
       syncInFlight.add(runKey);
       activeSyncs.add(runKey);
@@ -982,6 +993,7 @@
 
   async function notify(tabId, result) {
     setSyncIndicator(activeSyncForTab(tabId), tabId);
+    if (result?.inProgress || result?.skipped === 'in-progress') return;
     if (Number.isInteger(tabId) && tabId >= 0) api.tabs.sendMessage(tabId, { type: 'SYNC_RESULT', ...result }).catch(() => {});
     if (result.ok && api.notifications) {
       api.notifications.create(`pin-${Date.now()}`, { type: 'basic', title: 'Pin to GitHub', message: result.message, iconUrl: api.runtime.getURL('icon-128.png') }).catch(() => {});

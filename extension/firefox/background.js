@@ -178,7 +178,8 @@
     const revision=data?.project_revision || data?.revision ||
       project.current_revision || project.currentRevision || project.revision || {};
     const version=project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
-    return { project, revision, version, ready:Boolean(String(project.slug || '').trim()) && version !== null && revision.draft !== true };
+    const hasSlug=Boolean(String(project.slug || '').trim());
+    return { project, revision, version, hasSlug, ready:version !== null && revision.draft !== true && (hasSlug || Number(version) >= 2) };
   }
   function readinessRetryKey(projectId, tabId) { return syncKey(projectId, tabId); }
   function cancelReadinessRetry(projectId, tabId) {
@@ -327,7 +328,7 @@
       projectId = await resolveProjectId(payload); if (!projectId) throw new Error('Could not identify the pinned project');
       rememberProjectLogScope(projectId, tabId);
       const runKey = syncKey(projectId, tabId);
-      if (syncInFlight.has(runKey)) { await debugLog('sync.skipped-in-flight', { projectId, tabId:normalizedTabId(tabId) }); return { ok:true, inProgress:true, message:'A sync for this project is already in progress' }; }
+      if (syncInFlight.has(runKey)) { await debugLog('sync.skipped-in-flight', { projectId, tabId:normalizedTabId(tabId) }); return { ok:true, inProgress:true, skipped:'in-progress', message:'This project is already being synced' }; }
       syncInFlight.add(runKey);
       activeSyncs.add(runKey);
       setSyncIndicator(true, tabId);
@@ -372,7 +373,7 @@
     if (tabId !== null) api.tabs.sendMessage(tabId, { type:'SYNC_STARTED', source:'project-patch' }).catch(() => {});
     sync(payload,tabId).then((result) => notify(tabId,result)).catch((error) => notify(tabId,{ ok:false, message:error.message }));
   }
-  function notify(tabId, result) { setSyncIndicator(activeSyncForTab(tabId), tabId); if (Number.isInteger(tabId) && tabId >= 0) api.tabs.sendMessage(tabId, { type:'SYNC_RESULT', ...result }).catch(() => {}); if (result.ok && api.notifications) api.notifications.create(`pin-${Date.now()}`, { type:'basic', title:'Pin to GitHub', message:result.message, iconUrl:api.runtime.getURL('icon-128.png') }).catch(() => {}); }
+  function notify(tabId, result) { setSyncIndicator(activeSyncForTab(tabId), tabId); if (result?.inProgress || result?.skipped === 'in-progress') return; if (Number.isInteger(tabId) && tabId >= 0) api.tabs.sendMessage(tabId, { type:'SYNC_RESULT', ...result }).catch(() => {}); if (result.ok && api.notifications) api.notifications.create(`pin-${Date.now()}`, { type:'basic', title:'Pin to GitHub', message:result.message, iconUrl:api.runtime.getURL('icon-128.png') }).catch(() => {}); }
   if (api.webRequest?.onBeforeRequest) {
     const requestFilter = { urls:['https://websim.com/*','https://*.websim.com/*'] };
     try {
