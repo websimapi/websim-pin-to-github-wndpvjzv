@@ -51,21 +51,105 @@
     }
   }
 
+  function decodeRequestBytes(bytes) {
+    try {
+      if (!bytes) return '';
+      if (Array.isArray(bytes)) return new TextDecoder().decode(new Uint8Array(bytes));
+      return new TextDecoder().decode(bytes);
+    } catch {
+      return '';
+    }
+  }
+
+  function requestFieldEntries(value, prefix = '', depth = 0) {
+    if (!value || typeof value !== 'object' || depth > 3) return [];
+    return Object.entries(value).flatMap(([key, child]) => {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (child && typeof child === 'object') {
+        if (Array.isArray(child)) return [[path, `[${child.length} items]`]];
+        return requestFieldEntries(child, path, depth + 1);
+      }
+      return [[path, child]];
+    });
+  }
+
   function requestBodySummary(body) {
     if (!body) return { kind: null, keys: [], versionFields: {} };
     let parsed = body.formData || null;
     if (!parsed && body.raw?.length) {
-      try {
-        const bytes = body.raw.find((part) => part.bytes)?.bytes;
-        const text = bytes ? new TextDecoder().decode(bytes) : '';
-        parsed = text ? JSON.parse(text) : null;
-      } catch {}
+      for (const part of body.raw) {
+        const text = decodeRequestBytes(part.bytes);
+        if (!text) continue;
+        try {
+          parsed = JSON.parse(text);
+          break;
+        } catch {
+          try {
+            const params = new URLSearchParams(text);
+            if ([...params.keys()].length) {
+              parsed = Object.fromEntries(params.entries());
+              break;
+            }
+          } catch {}
+        }
+      }
     }
     if (!parsed || typeof parsed !== 'object') return { kind: 'raw', keys: [], versionFields: {} };
-    const versionFields = Object.fromEntries(Object.entries(parsed)
+    const entries = requestFieldEntries(parsed);
+    const versionFields = Object.fromEntries(entries
       .filter(([key]) => /pin|version|revision/i.test(key))
+      .slice(0, 24)
       .map(([key, value]) => [key, typeof value === 'string' ? value.slice(0, 80) : value]));
-    return { kind: body.formData ? 'formData' : 'json', keys: Object.keys(parsed).slice(0, 40), versionFields };
+    return {
+      kind: body.formData ? 'formData' : 'json',
+      keys: entries.map(([key]) => key).slice(0, 40),
+      versionFields
+    };
+  }
+
+  function mutationStateEntries(value, prefix = '', depth = 0) {
+    if (!value || typeof value !== 'object' || depth > 3) return [];
+    return Object.entries(value).flatMap(([key, child]) => {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (/pin|bookmark|version|revision/i.test(key)) return [[path, child]];
+      if (child && typeof child === 'object' && !Array.isArray(child)) {
+        return mutationStateEntries(child, path, depth + 1);
+      }
+      return [];
+    });
+  }
+
+  function projectMutationState(data) {
+    const project = data?.project || data?.site || data || {};
+    const revision = data?.project_revision || data?.revision || {};
+    const fields = Object.fromEntries(
+      [...mutationStateEntries(project), ...mutationStateEntries(revision)]
+        .sort(([a], [b]) => a.localeCompare(b))
+    );
+    return {
+      version: project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null,
+      fingerprint: JSON.stringify(fields)
+    };
+  }
+
+  async function readProjectMutationState(projectId) {
+    try {
+      return projectMutationState(await wsJson(`/projects/${encodeURIComponent(projectId)}`));
+    } catch {
+      return null;
+    }
+  }
+
+  function knownSyncedVersion(settings, projectId) {
+    const mapped = settings.projectMap?.[projectId];
+    if (!mapped?.repo) return null;
+    const branch = mapped.branch || branchName(settings, {});
+    const versions = settings.syncedVersions || {};
+    const directKey = `${settings.owner || ''}/${mapped.repo}:${projectId}:${branch}`;
+    if (versions[directKey] !== undefined && versions[directKey] !== null) return versions[directKey];
+    const suffix = `/${mapped.repo}:${projectId}:${branch}`;
+    const matchingKey = Object.keys(versions).find((key) => key.endsWith(suffix));
+    return matchingKey ? versions[matchingKey] : null;
   }
 
   function setSyncIndicator(active) {
@@ -485,11 +569,37 @@
     }
   }
 
-  async function triggerAutoSync(details, mutation, body) {
+  async function triggerAutoSync(details, mutation, body, beforeState) {
     const tabId = Number.isInteger(details.tabId) && details.tabId >= 0 ? details.tabId : null;
     await debugLog('pin.candidate.response', { tabId, projectId: mutation.projectId, status: details.statusCode, body });
     if (details.statusCode < 200 || details.statusCode >= 300) return;
     await new Promise((resolve) => setTimeout(resolve, 350));
+    const settings = await config();
+    const afterState = await readProjectMutationState(mutation.projectId);
+    if (!beforeState || !afterState) {
+      await debugLog('pin.candidate.ignored', {
+        projectId: mutation.projectId,
+        reason: 'pin-state-unavailable'
+      });
+      return;
+    }
+    if (beforeState.version === afterState.version && beforeState.fingerprint === afterState.fingerprint) {
+      await debugLog('pin.candidate.ignored', {
+        projectId: mutation.projectId,
+        reason: 'pin-state-unchanged',
+        version: afterState.version
+      });
+      return;
+    }
+    if (afterState && knownSyncedVersion(settings, mutation.projectId) !== null &&
+      String(knownSyncedVersion(settings, mutation.projectId)) === String(afterState.version)) {
+      await debugLog('pin.candidate.ignored', {
+        projectId: mutation.projectId,
+        reason: 'version-already-synced',
+        version: afterState.version
+      });
+      return;
+    }
     let tab = null;
     if (tabId !== null) {
       try { tab = await api.tabs.get(tabId); } catch {}
@@ -538,7 +648,8 @@
         const mutation = details.method === 'PATCH' ? projectMutation(details.url) : null;
         const body = requestBodySummary(details.requestBody);
         if (mutation) {
-          trackedWebsimRequests.set(details.requestId, { mutation, body, tabId: details.tabId });
+          const beforeState = readProjectMutationState(mutation.projectId);
+          trackedWebsimRequests.set(details.requestId, { mutation, body, beforeState, tabId: details.tabId });
           debugLog('pin.candidate.request', { tabId: details.tabId, projectId: mutation.projectId, method: details.method, body });
         }
         config().then((state) => state.advancedLogs && debugLog('network.request', {
@@ -555,7 +666,9 @@
         const tracked = trackedWebsimRequests.get(details.requestId);
         if (tracked) {
           trackedWebsimRequests.delete(details.requestId);
-          triggerAutoSync(details, tracked.mutation, tracked.body).catch((error) => {
+          Promise.resolve(tracked.beforeState).then((beforeState) =>
+            triggerAutoSync(details, tracked.mutation, tracked.body, beforeState)
+          ).catch((error) => {
             debugLog('pin.autosync.failed', { tabId: details.tabId, projectId: tracked.mutation.projectId, message: error.message });
           });
         }
