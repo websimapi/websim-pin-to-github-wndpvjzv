@@ -19,6 +19,7 @@ function render(state) {
   currentState = state;
   $('enabled').checked = state.enabled !== false;
   $('visibility').value = state.visibility || 'private';
+  $('visibility-scope').textContent = state.visibilityScope === 'project-tab' ? 'Saved for this project in this tab' : 'Default for new repositories';
   $('branchMode').value = state.branchMode || 'main';
   $('customBranch').value = state.customBranch || '';
   $('advanced-logs').checked = state.advancedLogs === true;
@@ -60,7 +61,7 @@ async function refreshProjectLink() {
     }
     if (!result?.ok) throw new Error(result?.message || 'Could not inspect the project link');
     repoNode.textContent = `${result.owner}/${result.repo}`;
-    metaNode.textContent = `${result.status === 'linked' ? 'Linked repository' : 'Planned repository'} · ${result.branch} branch`;
+    metaNode.textContent = `${result.status === 'linked' ? 'Linked repository' : 'Planned repository'} · ${result.branch} branch · ${result.visibility}`;
     linkNode.href = result.url;
     linkNode.hidden = false;
   } catch (error) {
@@ -95,14 +96,15 @@ async function copyLogs() {
 $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const tokenInput = $('token').value.trim();
+  const tab = await activeTab();
   const result = await send({ type: 'SAVE_SETTINGS', settings: {
     token: tokenInput,
     visibility: $('visibility').value,
     branchMode: $('branchMode').value,
     customBranch: $('customBranch').value.trim(),
     enabled: $('enabled').checked
-  }});
-  if (result?.ok) { $('token').value = ''; showMessage('Saved locally. Pin a Websim project to sync.'); render(await stateForActiveTab()); refreshProjectLink(); }
+  }, tabId: tab?.id, url: tab?.url, title: tab?.title });
+  if (result?.ok) { $('token').value = ''; showMessage(result.message || 'Saved locally.'); render(await stateForActiveTab()); refreshProjectLink(); }
   else showMessage(result?.message || 'Could not validate this token.', true);
 });
 

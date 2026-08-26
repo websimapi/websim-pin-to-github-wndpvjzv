@@ -9,6 +9,7 @@ function render(state) {
   currentState = state;
   $('enabled').checked = state.enabled !== false;
   $('visibility').value = state.visibility || 'private';
+  $('visibility-scope').textContent = state.visibilityScope === 'project-tab' ? 'Saved for this project in this tab' : 'Default for new repositories';
   $('branchMode').value = state.branchMode || 'main';
   $('customBranch').value = state.customBranch || '';
   $('advanced-logs').checked = state.advancedLogs === true;
@@ -30,7 +31,7 @@ async function refreshProjectLink() {
     if (result?.status === 'not-configured') { repoNode.textContent='Connect GitHub first'; metaNode.textContent='The linked repository appears after setup'; return; }
     if (result?.status === 'not-websim') { repoNode.textContent='No Websim project detected'; metaNode.textContent='Open a Websim project in the active tab'; return; }
     if (!result?.ok) throw new Error(result?.message || 'Could not inspect the project link');
-    repoNode.textContent=`${result.owner}/${result.repo}`; metaNode.textContent=`${result.status === 'linked' ? 'Linked repository' : 'Planned repository'} · ${result.branch} branch`; linkNode.href=result.url; linkNode.hidden=false;
+    repoNode.textContent=`${result.owner}/${result.repo}`; metaNode.textContent=`${result.status === 'linked' ? 'Linked repository' : 'Planned repository'} · ${result.branch} branch · ${result.visibility}`; linkNode.href=result.url; linkNode.hidden=false;
   } catch (error) { repoNode.textContent='Repository unavailable'; metaNode.textContent=error.message || 'Could not check GitHub'; }
 }
 function message(text, error = false) { $('message').textContent = text || ''; $('message').className = `message${error ? ' error' : ''}`; }
@@ -51,8 +52,9 @@ async function copyLogs() {
 $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const tokenInput = $('token').value.trim();
-  const result = await send({ type:'SAVE_SETTINGS', settings:{ token:tokenInput, visibility:$('visibility').value, branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked } });
-  if (result?.ok) { $('token').value=''; message('Saved locally. Pin a Websim project to sync.'); render(await stateForActiveTab()); refreshProjectLink(); }
+  const tab = await activeTab();
+  const result = await send({ type:'SAVE_SETTINGS', settings:{ token:tokenInput, visibility:$('visibility').value, branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked }, tabId:tab?.id, url:tab?.url, title:tab?.title });
+  if (result?.ok) { $('token').value=''; message(result.message || 'Saved locally.'); render(await stateForActiveTab()); refreshProjectLink(); }
   else message(result?.message || 'Could not validate this token.', true);
 });
 $('branchMode').addEventListener('change', () => $('custom-branch-wrap').classList.toggle('hidden', $('branchMode').value !== 'custom'));

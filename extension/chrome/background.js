@@ -4,7 +4,7 @@
   const WS_API = 'https://websim.com/api/v1';
   const defaults = {
     enabled: true, token: '', owner: '', branchMode: 'main', customBranch: '',
-    visibility: 'private', lastEvents: [], syncedVersions: {}, projectMap: {}, debugLogs: [],
+    visibility: 'private', visibilityByContext: {}, lastEvents: [], syncedVersions: {}, projectMap: {}, debugLogs: [],
     advancedLogs: true, advancedLogsConfigured: false
   };
 
@@ -31,6 +31,19 @@
   function syncKey(projectId, tabId) {
     const scope = normalizedTabId(tabId);
     return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`;
+  }
+
+  function visibilityKey(projectId, tabId) {
+    return syncKey(projectId, tabId);
+  }
+
+  function normalizedVisibility(value) {
+    return value === 'public' ? 'public' : 'private';
+  }
+
+  function visibilityForContext(settings, projectId, tabId) {
+    const scoped = projectId ? settings.visibilityByContext?.[visibilityKey(projectId, tabId)] : null;
+    return normalizedVisibility(scoped ?? settings.visibility);
   }
 
   function activeSyncForTab(tabId) {
@@ -370,6 +383,8 @@
     const tabId = normalizedTabId(message.tabId);
     return {
       ...stored,
+      visibility: visibilityForContext(stored, projectId, tabId),
+      visibilityScope: projectId ? 'project-tab' : 'default',
       activeTabId: tabId,
       activeProjectId: projectId,
       lastEvents: eventsForProject(stored.lastEvents, projectId, tabId),
@@ -644,7 +659,7 @@
     return null;
   }
 
-  async function ensureRepository(payload, revision, settings) {
+  async function ensureRepository(payload, revision, settings, tabId) {
     await debugLog('repository.resolve.start', {
       projectId: payload.projectId,
       requestedName: generatedRepoName(payload.projectId, payload.title || revision.title, payload.slug || revision.slug)
@@ -652,6 +667,7 @@
     const user = await githubRequest('/user', settings.token);
     const owner = user.login;
     const mapped = settings.projectMap?.[payload.projectId];
+    const visibility = visibilityForContext(settings, payload.projectId, tabId);
     const generatedName = generatedRepoName(payload.projectId, payload.title || revision.title, payload.slug || revision.slug);
     const repoNames = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
     let repository = await findExistingRepository(owner, settings.token, payload.projectId, repoNames);
@@ -663,7 +679,7 @@
         body: JSON.stringify({
           name: repoName,
           description: `Websim backup for ${payload.title || payload.projectId}`,
-          private: settings.visibility !== 'public',
+          private: visibility !== 'public',
           auto_init: false
         }),
         headers: { 'Content-Type': 'application/json' }
@@ -672,7 +688,7 @@
       await debugLog('repository.created', {
         owner,
         repo: repoName,
-        visibility: settings.visibility === 'public' ? 'public' : 'private'
+        visibility
       });
     }
     const mappedRepository = mapped?.repo && String(repository.name || repoName).toLowerCase() === String(mapped.repo).toLowerCase();
@@ -932,7 +948,7 @@
         projectId,
         title: payload.title || readiness.project.title || null,
         slug: readiness.project.slug || null
-      }, revision, settings);
+      }, revision, settings, tabId);
       rememberRepoLogScope(target.owner, target.repo, projectId, tabId);
       const versionKey = `${target.owner}/${target.repo}:${projectId}:${target.branch}`;
       if (String(settings.syncedVersions?.[versionKey]) === String(version)) {
@@ -1056,8 +1072,80 @@
     rememberRepoLogScope(user.login, repo, projectId, payload.tabId);
     const mappedRepository = mapped?.repo && repo.toLowerCase() === String(mapped.repo).toLowerCase();
     const branch = mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository || {});
-    await debugLog('repository.link.preview', { projectId, owner: user.login, repo, branch, status: repository ? 'linked' : 'planned' });
-    return { ok: true, status: repository ? 'linked' : 'planned', projectId, owner: user.login, repo, branch, url: `https://github.com/${user.login}/${repo}` };
+    const visibility = repository ? (repository.private ? 'private' : 'public') : visibilityForContext(settings, projectId, payload.tabId);
+    await debugLog('repository.link.preview', { projectId, owner: user.login, repo, branch, visibility, status: repository ? 'linked' : 'planned' });
+    return { ok: true, status: repository ? 'linked' : 'planned', projectId, owner: user.login, repo, branch, visibility, url: `https://github.com/${user.login}/${repo}` };
+  }
+
+  async function saveSettings(message) {
+    const stored = await config();
+    const incoming = message.settings || {};
+    const token = incoming.token || stored.token;
+    const tabId = normalizedTabId(message.tabId);
+    const projectId = await resolveProjectId(message);
+    const visibility = normalizedVisibility(incoming.visibility);
+    let owner = stored.owner || '';
+    let repository = null;
+
+    if (token) {
+      const user = await githubRequest('/user', token);
+      owner = user.login;
+    }
+
+    if (projectId && token) {
+      rememberProjectLogScope(projectId, tabId);
+      let project = {};
+      try {
+        const response = await wsJson(`/projects/${encodeURIComponent(projectId)}`);
+        project = projectReadiness(response).project;
+      } catch {}
+      const mapped = stored.projectMap?.[projectId];
+      const generatedName = generatedRepoName(projectId, message.title || project.title, project.slug);
+      const names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
+      repository = await findExistingRepository(owner, token, projectId, names);
+      if (repository && Boolean(repository.private) !== (visibility === 'private')) {
+        await githubRequest(repoPath(owner, repository.name), token, {
+          method: 'PATCH',
+          body: JSON.stringify({ private: visibility === 'private' }),
+          headers: { 'Content-Type': 'application/json' }
+        });
+        await debugLog('repository.visibility.updated', {
+          projectId,
+          tabId,
+          owner,
+          repo: repository.name,
+          visibility
+        });
+      }
+    }
+
+    const next = {
+      ...stored,
+      ...incoming,
+      token,
+      owner,
+      visibility: normalizedVisibility(stored.visibility)
+    };
+    if (projectId) {
+      next.visibilityByContext = {
+        ...(stored.visibilityByContext || {}),
+        [visibilityKey(projectId, tabId)]: visibility
+      };
+    } else {
+      next.visibility = visibility;
+    }
+    await storageSet(next);
+
+    const repositoryMessage = repository
+      ? ` Updated ${owner}/${repository.name} to ${visibility}.`
+      : '';
+    return {
+      ok: true,
+      owner,
+      projectId,
+      visibility,
+      message: `${projectId ? 'Saved for this project and tab.' : 'Saved as the default for new repositories.'}${repositoryMessage}`
+    };
   }
 
   if (api.webRequest?.onBeforeRequest) {
@@ -1179,20 +1267,7 @@
       return true;
     }
     if (message?.type === 'SAVE_SETTINGS') {
-      config().then((stored) => storageSet({
-        ...stored,
-        ...message.settings,
-        token: message.settings.token || stored.token
-      })).then(async () => {
-        const saved = await config();
-        let owner = saved.owner || '';
-        if (saved.token) {
-          const user = await githubRequest('/user', saved.token);
-          owner = user.login;
-          await storageSet({ owner });
-        }
-        sendResponse({ ok: true, owner });
-      }).catch((error) => sendResponse({ ok: false, message: error.message }));
+      saveSettings(message).then(sendResponse).catch((error) => sendResponse({ ok: false, message: error.message }));
       return true;
     }
     if (message?.type === 'PIN_DETECTED') {
