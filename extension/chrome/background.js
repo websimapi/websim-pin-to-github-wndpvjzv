@@ -431,10 +431,16 @@
         await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'version-already-synced', version });
         return { ok: true, skipped: 'version-already-synced', projectId };
       }
+      const readyPayload = {
+        ...payload,
+        projectId,
+        title: payload.title || project.title || null,
+        slug: project.slug || null
+      };
       rememberProjectLogScope(projectId, tabId);
       setSyncIndicator(true, tabId);
       if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type: 'SYNC_STARTED', source: 'project-page-ready' }).catch(() => {});
-      return await sync({ ...payload, projectId }, tabId);
+      return await sync(readyPayload, tabId);
     } finally {
       automaticSyncChecks.delete(checkKey);
     }
@@ -500,8 +506,8 @@
     return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   }
 
-  function generatedRepoName(projectId, title) {
-    const readable = String(title || 'websim-project').toLowerCase()
+  function generatedRepoName(projectId, title, slug) {
+    const readable = String(slug || title || 'websim-project').toLowerCase()
       .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 54) || 'project';
     const suffix = String(projectId || 'backup').replace(/[^a-z0-9]/gi, '').slice(-8).toLowerCase() || 'backup';
     return `websim-${readable}-${suffix}`.slice(0, 100);
@@ -560,12 +566,12 @@
   async function ensureRepository(payload, revision, settings) {
     await debugLog('repository.resolve.start', {
       projectId: payload.projectId,
-      requestedName: generatedRepoName(payload.projectId, payload.title || revision.title)
+      requestedName: generatedRepoName(payload.projectId, payload.title || revision.title, payload.slug || revision.slug)
     });
     const user = await githubRequest('/user', settings.token);
     const owner = user.login;
     const mapped = settings.projectMap?.[payload.projectId];
-    const generatedName = generatedRepoName(payload.projectId, payload.title || revision.title);
+    const generatedName = generatedRepoName(payload.projectId, payload.title || revision.title, payload.slug || revision.slug);
     const repoNames = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
     let repository = await findExistingRepository(owner, settings.token, payload.projectId, repoNames);
     let created = false;
@@ -833,7 +839,12 @@
       const { version, revision } = await currentRevision(projectId);
       await debugLog('websim.revision.selected', { projectId, version });
       stage = 'resolve-or-create-repository';
-      const target = await ensureRepository({ ...payload, projectId }, revision, settings);
+      const target = await ensureRepository({
+        ...payload,
+        projectId,
+        title: payload.title || readiness.project.title || null,
+        slug: readiness.project.slug || null
+      }, revision, settings);
       rememberRepoLogScope(target.owner, target.repo, projectId, tabId);
       const versionKey = `${target.owner}/${target.repo}:${projectId}:${target.branch}`;
       if (String(settings.syncedVersions?.[versionKey]) === String(version)) {
@@ -927,7 +938,12 @@
     rememberProjectLogScope(projectId, payload.tabId);
     const mapped = settings.projectMap?.[projectId];
     const user = await githubRequest('/user', settings.token);
-    const generatedName = generatedRepoName(projectId, payload?.title);
+    let project = {};
+    try {
+      const response = await wsJson(`/projects/${encodeURIComponent(projectId)}`);
+      project = projectReadiness(response).project;
+    } catch {}
+    const generatedName = generatedRepoName(projectId, payload?.title || project.title, project.slug);
     const names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
     const repository = await findExistingRepository(user.login, settings.token, projectId, names);
     const repo = repository?.name || generatedName;
