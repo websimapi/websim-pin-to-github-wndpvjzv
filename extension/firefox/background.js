@@ -182,7 +182,10 @@
       project.current_revision || project.currentRevision || project.revision || {};
     const version=project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
     const hasSlug=Boolean(String(project.slug || '').trim());
-    return { project, revision, version, hasSlug, ready:hasSlug && version !== null && revision.draft !== true };
+    // The slug can lag behind publication by minutes. A finalized revision
+    // is still safe to sync because generatedRepoName falls back to the
+    // project title until the canonical slug is available.
+    return { project, revision, version, hasSlug, ready:version !== null && revision.draft !== true };
   }
   function readinessRetryKey(projectId, tabId) { return syncKey(projectId, tabId); }
   function cancelReadinessRetry(projectId, tabId) {
@@ -196,8 +199,7 @@
     if (!projectId) return;
     const key=readinessRetryKey(projectId, tabId), pending=readinessRetryTimers.get(key);
     if (pending?.timer) return;
-    const attempt=pending?.attempt || 0, delay=readinessRetryDelays[attempt];
-    if (delay === undefined) { debugLog('sync.page-ready.retry.exhausted', { projectId, tabId:normalizedTabId(tabId), attempts:readinessRetryDelays.length }); return; }
+    const attempt=pending?.attempt || 0, delay=readinessRetryDelays[Math.min(attempt, readinessRetryDelays.length - 1)];
     const retry={ attempt:attempt + 1, timer:setTimeout(() => {
       readinessRetryTimers.set(key, { attempt:retry.attempt, timer:null });
       autoSyncNewProject(payload, tabId).then((result) => { if (!result?.skipped) notify(tabId,result); }).catch((error) => debugLog('sync.page-ready.failed', { tabId:normalizedTabId(tabId), projectId, message:error.message }));

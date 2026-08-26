@@ -158,8 +158,8 @@
   function requestPageReady(payload, attempt = 0) {
     api.runtime.sendMessage({ type: 'PROJECT_PAGE_READY', payload }).then((result) => {
       const retryable = result?.skipped === 'project-not-ready' || result?.skipped === 'project-not-found';
-      const delay = pageReadyRetryDelays[attempt];
-      if (retryable && window.top === window.self && delay !== undefined) {
+      const delay = pageReadyRetryDelays[Math.min(attempt, pageReadyRetryDelays.length - 1)];
+      if (retryable && window.top === window.self) {
         debug('content.page-ready.retry', { attempt: attempt + 1, delayMs: delay, reason: result.skipped });
         window.setTimeout(() => requestPageReady(payload, attempt + 1), delay);
         return;

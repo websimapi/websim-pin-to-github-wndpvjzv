@@ -56,8 +56,8 @@
   const pageReadyRetryDelays=[500,1000,2000,3000,5000,8000,12000,20000];
   function requestPageReady(payload, attempt=0) {
     api.runtime.sendMessage({ type:'PROJECT_PAGE_READY', payload }).then((result) => {
-      const retryable=result?.skipped === 'project-not-ready' || result?.skipped === 'project-not-found', delay=pageReadyRetryDelays[attempt];
-      if (retryable && window.top === window.self && delay !== undefined) {
+      const retryable=result?.skipped === 'project-not-ready' || result?.skipped === 'project-not-found', delay=pageReadyRetryDelays[Math.min(attempt, pageReadyRetryDelays.length - 1)];
+      if (retryable && window.top === window.self) {
         debug('content.page-ready.retry', { attempt:attempt + 1, delayMs:delay, reason:result.skipped });
         window.setTimeout(() => requestPageReady(payload, attempt + 1), delay);
         return;

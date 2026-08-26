@@ -399,10 +399,10 @@
       revision,
       version,
       hasSlug,
-      // A revision is eligible only after Websim has assigned its canonical
-      // slug. This prevents v1 drafts and slug-less v2 revisions from being
-      // committed to a temporary ID/title-based repository.
-      ready: hasSlug && version !== null && revision.draft !== true
+      // The slug can lag behind publication by minutes. A finalized revision
+      // is still safe to sync because generatedRepoName falls back to the
+      // project title until the canonical slug is available.
+      ready: version !== null && revision.draft !== true
     };
   }
 
@@ -425,15 +425,7 @@
     const pending = readinessRetryTimers.get(key);
     if (pending?.timer) return;
     const attempt = pending?.attempt || 0;
-    const delay = readinessRetryDelays[attempt];
-    if (delay === undefined) {
-      debugLog('sync.page-ready.retry.exhausted', {
-        projectId,
-        tabId: normalizedTabId(tabId),
-        attempts: readinessRetryDelays.length
-      });
-      return;
-    }
+    const delay = readinessRetryDelays[Math.min(attempt, readinessRetryDelays.length - 1)];
     const retry = {
       attempt: attempt + 1,
       timer: setTimeout(() => {
