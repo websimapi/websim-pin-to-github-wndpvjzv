@@ -1,15 +1,22 @@
 (() => {
   const api = globalThis.browser || globalThis.chrome;
   const GH_API = 'https://api.github.com', WS_API = 'https://websim.com/api/v1';
-  const defaults = { enabled:true, token:'', owner:'', branchMode:'main', customBranch:'', visibility:'private', lastEvents:[], syncedVersions:{}, projectMap:{}, debugLogs:[] };
+  const defaults = { enabled:true, token:'', owner:'', branchMode:'main', customBranch:'', visibility:'private', lastEvents:[], syncedVersions:{}, projectMap:{}, debugLogs:[], advancedLogs:false };
   const storageGet = (keys) => new Promise((resolve) => api.storage.local.get(keys, resolve));
   const storageSet = (value) => new Promise((resolve) => api.storage.local.set(value, resolve));
   let logQueue = Promise.resolve();
+  const trackedWebsimRequests = new Map();
+  const syncInFlight = new Set();
   function debugLog(event, detail = {}) {
     const entry = { at:new Date().toISOString(), event, ...detail };
     logQueue = logQueue.then(async () => { const stored = await storageGet({ debugLogs:[] }); await storageSet({ debugLogs:[...(stored.debugLogs || []), entry].slice(-160) }); }).catch(() => {});
     return logQueue;
   }
+  function safeDebugDetail(detail = {}) { return Object.fromEntries(Object.entries(detail).slice(0,24).map(([key,value]) => { if (typeof value === 'string') return [key,value.replace(/([?&](?:token|access_token|authorization|code|key)=)[^&]*/gi,'$1[redacted]').slice(0,400)]; if (typeof value === 'number' || typeof value === 'boolean' || value === null) return [key,value]; return [key,String(value).slice(0,400)]; })); }
+  function websimNetworkUrl(value) { try { const url = new URL(value); if (!/(^|\.)websim\.com$/i.test(url.hostname)) return null; if (!/\/api\//i.test(url.pathname) && !/(pin|pinned|bookmark|collection|save)/i.test(url.pathname)) return null; return `${url.origin}${url.pathname}`; } catch { return null; } }
+  function projectMutation(value) { try { const url=new URL(value), match=url.pathname.match(/\/api\/v1\/projects\/([^/]+)$/i); return match ? { projectId:decodeURIComponent(match[1]) } : null; } catch { return null; } }
+  function requestBodySummary(body) { if (!body) return { kind:null, keys:[], versionFields:{} }; let parsed=body.formData || null; if (!parsed && body.raw?.length) { try { const bytes=body.raw.find((part) => part.bytes)?.bytes, text=bytes ? new TextDecoder().decode(bytes) : ''; parsed=text ? JSON.parse(text) : null; } catch {} } if (!parsed || typeof parsed !== 'object') return { kind:'raw', keys:[], versionFields:{} }; const versionFields=Object.fromEntries(Object.entries(parsed).filter(([key]) => /pin|version|revision/i.test(key)).map(([key,value]) => [key,typeof value === 'string' ? value.slice(0,80) : value])); return { kind:body.formData ? 'formData' : 'json', keys:Object.keys(parsed).slice(0,40), versionFields }; }
+  function setSyncIndicator(active) { const action=api.action || api.browserAction; if (!action) return; Promise.resolve(action.setBadgeText?.({ text:active ? '…' : '' })).catch(() => {}); Promise.resolve(action.setBadgeBackgroundColor?.({ color:active ? '#d9ee65' : '#11131a' })).catch(() => {}); Promise.resolve(action.setTitle?.({ title:active ? 'Pin to GitHub · syncing…' : 'Pin to GitHub' })).catch(() => {}); }
   async function config() { return { ...defaults, ...(await storageGet(defaults)) }; }
   async function request(url, options = {}) {
     const response = await fetch(url, { ...options, headers:{ Accept:'application/vnd.github+json', ...(options.headers || {}) } });
@@ -65,8 +72,11 @@
     }
     return null;
   }
+  function projectIdFromWebsimUrl(value) { if (!value) return null; try { const url=new URL(value), route=url.pathname.match(/\/([cp])\/([a-zA-Z0-9_-]+)/), host=url.hostname.match(/^([a-zA-Z0-9_-]+)\.c\.websim\.com$/i); return route?.[2] || host?.[1] || null; } catch { return null; } }
   async function resolveProjectId(payload) {
     if (payload?.projectId) return payload.projectId;
+    const directProjectId = projectIdFromWebsimUrl(payload?.url);
+    if (directProjectId) return directProjectId;
     try {
       const route = new URL(payload?.url || ''), match = route.pathname.match(/^\/@([^/]+)\/([^/]+)/);
       if (!match) return null;
@@ -132,10 +142,13 @@
     return { sha:created.sha, version, title, url:created.html_url || `https://github.com/${target.owner}/${target.repo}/commit/${created.sha}` };
   }
   async function sync(payload, tabId) {
-    const settings = await config(); if (!settings.enabled) throw new Error('Auto-sync is paused in the extension popup'); if (!settings.token) throw new Error('Open the extension popup and finish GitHub setup');
+    const settings = await config(); await debugLog('sync.request.received', { tabId:tabId || null, projectId:payload?.projectId || null, url:payload?.url ? String(payload.url).split(/[?#]/)[0] : null, title:payload?.title || null }); if (!settings.enabled) { await debugLog('sync.blocked', { reason:'auto-sync-disabled' }); throw new Error('Auto-sync is paused in the extension popup'); } if (!settings.token) { await debugLog('sync.blocked', { reason:'github-token-missing' }); throw new Error('Open the extension popup and finish GitHub setup'); }
     let stage = 'resolve-project'; await debugLog('sync.start', { projectId:payload?.projectId || null, url:payload?.url || null, title:payload?.title || null });
+    let projectId = null;
     try {
-      const projectId = await resolveProjectId(payload); if (!projectId) throw new Error('Could not identify the pinned project');
+      projectId = await resolveProjectId(payload); if (!projectId) throw new Error('Could not identify the pinned project');
+      if (syncInFlight.has(projectId)) { await debugLog('sync.skipped-in-flight', { projectId }); return { ok:true, inProgress:true, message:'A sync for this project is already in progress' }; }
+      syncInFlight.add(projectId);
       stage = 'fetch-current-revision';
       const { version, revision } = await currentRevision(projectId); await debugLog('websim.revision.selected', { projectId, version });
       stage = 'resolve-or-create-repository';
@@ -147,15 +160,30 @@
       await debugLog('sync.complete', { projectId, version, owner:target.owner, repo:target.repo, branch:target.branch, commitSha:result.sha });
       return { ok:true, message:`${target.created ? 'Created repo and committed' : 'Committed'} v${result.version} to ${target.owner}/${target.repo} · ${target.branch}`, commit:result };
     } catch (error) { await debugLog('sync.failed', { stage, status:error.status || null, message:error.message }); throw error; }
+    finally { if (projectId) syncInFlight.delete(projectId); }
   }
-  function notify(tabId, result) { if (tabId) api.tabs.sendMessage(tabId, { type:'SYNC_RESULT', ...result }).catch(() => {}); if (result.ok && api.notifications) api.notifications.create(`pin-${Date.now()}`, { type:'basic', title:'Pin to GitHub', message:result.message, iconUrl:api.runtime.getURL('icon-128.png') }).catch(() => {}); }
+  async function triggerAutoSync(details, mutation, body) { const tabId=Number.isInteger(details.tabId) && details.tabId >= 0 ? details.tabId : null; await debugLog('pin.candidate.response', { tabId, projectId:mutation.projectId, status:details.statusCode, body }); if (details.statusCode < 200 || details.statusCode >= 300) return; await new Promise((resolve) => setTimeout(resolve,350)); let tab=null; if (tabId !== null) { try { tab=await api.tabs.get(tabId); } catch {} } const payload={ projectId:mutation.projectId, url:tab?.url || details.documentUrl || `https://websim.com/p/${mutation.projectId}`, title:null }; await debugLog('pin.autosync.trigger', { tabId, ...payload }); setSyncIndicator(true); if (tabId !== null) api.tabs.sendMessage(tabId, { type:'SYNC_STARTED', source:'project-patch' }).catch(() => {}); sync(payload,tabId).then((result) => notify(tabId,result)).catch((error) => notify(tabId,{ ok:false, message:error.message })); }
+  function notify(tabId, result) { if (!result.inProgress) setSyncIndicator(false); if (Number.isInteger(tabId) && tabId >= 0) api.tabs.sendMessage(tabId, { type:'SYNC_RESULT', ...result }).catch(() => {}); if (result.ok && api.notifications) api.notifications.create(`pin-${Date.now()}`, { type:'basic', title:'Pin to GitHub', message:result.message, iconUrl:api.runtime.getURL('icon-128.png') }).catch(() => {}); }
+  if (api.webRequest?.onBeforeRequest) {
+    const requestFilter = { urls:['https://websim.com/*','https://*.websim.com/*'] };
+    try {
+      api.webRequest.onBeforeRequest.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const mutation=details.method === 'PATCH' ? projectMutation(details.url) : null, body=requestBodySummary(details.requestBody); if (mutation) { trackedWebsimRequests.set(details.requestId, { mutation, body, tabId:details.tabId }); debugLog('pin.candidate.request', { tabId:details.tabId, projectId:mutation.projectId, method:details.method, body }); } config().then((state) => state.advancedLogs && debugLog('network.request', { requestId:details.requestId, method:details.method, type:details.type, url, ...(mutation ? { projectId:mutation.projectId, body } : {}) })); }, requestFilter, ['requestBody']);
+      api.webRequest.onCompleted?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tracked=trackedWebsimRequests.get(details.requestId); if (tracked) { trackedWebsimRequests.delete(details.requestId); triggerAutoSync(details, tracked.mutation, tracked.body).catch((error) => debugLog('pin.autosync.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, message:error.message })); } config().then((state) => state.advancedLogs && debugLog('network.response', { requestId:details.requestId, status:details.statusCode, type:details.type, url })); }, requestFilter);
+      api.webRequest.onErrorOccurred?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tracked=trackedWebsimRequests.get(details.requestId); if (tracked) { trackedWebsimRequests.delete(details.requestId); debugLog('pin.candidate.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, error:details.error, body:tracked.body }); } config().then((state) => state.advancedLogs && debugLog('network.error', { requestId:details.requestId, error:details.error, type:details.type, url })); }, requestFilter);
+      debugLog('network.monitor.ready', { watches:['PATCH /api/v1/projects/{id}', 'Websim API requests'] });
+    } catch (error) { debugLog('network.monitor.unavailable', { message:error.message }); }
+  }
+  async function projectLink(payload) { const settings=await config(); if (!settings.token) return { ok:true, status:'not-configured' }; const projectId=await resolveProjectId(payload); if (!projectId) return { ok:true, status:'not-websim' }; const mapped=settings.projectMap?.[projectId], user=await gh('/user', settings.token), generatedName=generatedRepoName(projectId, payload?.title), names=[...new Set([mapped?.repo, generatedName].filter(Boolean))], repository=await findExistingRepository(user.login, settings.token, projectId, names), repo=repository?.name || generatedName, mappedRepository=mapped?.repo && repo.toLowerCase() === String(mapped.repo).toLowerCase(), branch=mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository || {}); await debugLog('repository.link.preview', { projectId, owner:user.login, repo, branch, status:repository ? 'linked' : 'planned' }); return { ok:true, status:repository ? 'linked' : 'planned', projectId, owner:user.login, repo, branch, url:`https://github.com/${user.login}/${repo}` }; }
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'GET_STATE') { config().then((state) => sendResponse({ ...state, token:'', hasToken:Boolean(state.token) })); return true; }
     if (message?.type === 'GET_LOGS') { config().then((state) => sendResponse({ logs:state.debugLogs || [] })); return true; }
+    if (message?.type === 'GET_PROJECT_LINK') { projectLink(message).then(sendResponse).catch((error) => sendResponse({ ok:false, message:error.message })); return true; }
     if (message?.type === 'CLEAR_LOGS') { storageSet({ debugLogs:[] }).then(() => sendResponse({ok:true})); return true; }
+    if (message?.type === 'SET_DEBUG_MODE') { storageSet({ advancedLogs:Boolean(message.enabled) }).then(() => sendResponse({ ok:true, advancedLogs:Boolean(message.enabled) })); return true; }
+    if (message?.type === 'DEBUG_EVENT') { config().then((stored) => { if (!stored.advancedLogs) return sendResponse({ ok:true, recorded:false }); debugLog(message.event || 'content.debug', safeDebugDetail(message.detail)).then(() => sendResponse({ ok:true, recorded:true })); }); return true; }
     if (message?.type === 'SAVE_SETTINGS') { config().then((state) => storageSet({ ...state, ...message.settings, token:message.settings.token || state.token })).then(async () => { const saved = await config(); let owner = saved.owner || ''; if (saved.token) { const user = await gh('/user', saved.token); owner = user.login; await storageSet({ owner }); } sendResponse({ ok:true, owner }); }).catch((error) => sendResponse({ ok:false, message:error.message })); return true; }
-    if (message?.type === 'PIN_DETECTED') { sync(message.payload, sender.tab?.id).then((result) => { notify(sender.tab?.id,result); sendResponse(result); }).catch((error) => { const result={ok:false,message:error.message}; notify(sender.tab?.id,result); sendResponse(result); }); return true; }
-    if (message?.type === 'SYNC_CURRENT') { const url=message.url || '', id=url.match(/\/(?:c|p)\/([a-zA-Z0-9_-]+)/)?.[1] || url.match(/^https:\/\/([a-zA-Z0-9_-]+)\.c\.websim\.com/)?.[1]; sync({ projectId:id, url, title:message.title }, message.tabId).then((result) => { notify(message.tabId,result); sendResponse(result); }).catch((error) => { const result={ok:false,message:error.message}; notify(message.tabId,result); sendResponse(result); }); return true; }
+    if (message?.type === 'PIN_DETECTED') { debugLog('pin.message.received', { tabId:sender.tab?.id || null, senderUrl:sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload:safeDebugDetail(message.payload || {}) }); setSyncIndicator(true); sync(message.payload, sender.tab?.id).then((result) => { notify(sender.tab?.id,result); sendResponse(result); }).catch((error) => { const result={ok:false,message:error.message}; notify(sender.tab?.id,result); sendResponse(result); }); return true; }
+    if (message?.type === 'SYNC_CURRENT') { const url=message.url || '', id=url.match(/\/(?:c|p)\/([a-zA-Z0-9_-]+)/)?.[1] || url.match(/^https:\/\/([a-zA-Z0-9_-]+)\.c\.websim\.com/)?.[1]; setSyncIndicator(true); sync({ projectId:id, url, title:message.title }, message.tabId).then((result) => { notify(message.tabId,result); sendResponse(result); }).catch((error) => { const result={ok:false,message:error.message}; notify(message.tabId,result); sendResponse(result); }); return true; }
   });
   api.runtime.onInstalled?.addListener(() => storageGet(defaults).then((stored) => storageSet({ ...defaults, ...stored })));
 })();

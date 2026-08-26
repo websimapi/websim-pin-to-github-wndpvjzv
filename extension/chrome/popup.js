@@ -12,6 +12,7 @@ function render(state) {
   $('visibility').value = state.visibility || 'private';
   $('branchMode').value = state.branchMode || 'main';
   $('customBranch').value = state.customBranch || '';
+  $('advanced-logs').checked = state.advancedLogs === true;
   $('custom-branch-wrap').classList.toggle('hidden', state.branchMode !== 'custom');
   $('github-account').textContent = state.owner ? `@${state.owner}` : 'Not connected yet';
   $('state-pill').textContent = state.enabled !== false && state.hasToken ? 'READY' : 'SETUP';
@@ -26,6 +27,38 @@ function render(state) {
       <small>${escapeHtml(new Date(item.at || Date.now()).toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' }))}</small>
     </div>`).join('') : '<p class="empty">No commits yet. Pin a project to begin.</p>';
   $('logs-output').textContent = formatLogs(state.debugLogs || []);
+}
+
+async function refreshProjectLink() {
+  const repoNode = $('linked-repo');
+  const metaNode = $('linked-repo-meta');
+  const linkNode = $('linked-repo-url');
+  repoNode.textContent = 'Detecting Websim project…';
+  metaNode.textContent = 'Checking the active tab';
+  linkNode.hidden = true;
+  try {
+    const tabs = await new Promise((resolve) => api.tabs.query({ active: true, currentWindow: true }, resolve));
+    const tab = tabs?.[0];
+    const result = await send({ type: 'GET_PROJECT_LINK', url: tab?.url, title: tab?.title });
+    if (result?.status === 'not-configured') {
+      repoNode.textContent = 'Connect GitHub first';
+      metaNode.textContent = 'The linked repository appears after setup';
+      return;
+    }
+    if (result?.status === 'not-websim') {
+      repoNode.textContent = 'No Websim project detected';
+      metaNode.textContent = 'Open a Websim project in the active tab';
+      return;
+    }
+    if (!result?.ok) throw new Error(result?.message || 'Could not inspect the project link');
+    repoNode.textContent = `${result.owner}/${result.repo}`;
+    metaNode.textContent = `${result.status === 'linked' ? 'Linked repository' : 'Planned repository'} · ${result.branch} branch`;
+    linkNode.href = result.url;
+    linkNode.hidden = false;
+  } catch (error) {
+    repoNode.textContent = 'Repository unavailable';
+    metaNode.textContent = error.message || 'Could not check GitHub';
+  }
 }
 
 function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char])); }
@@ -63,11 +96,16 @@ $('settings-form').addEventListener('submit', async (event) => {
     customBranch: $('customBranch').value.trim(),
     enabled: $('enabled').checked
   }});
-  if (result?.ok) { $('token').value = ''; showMessage('Saved locally. Pin a Websim project to sync.'); render(await send({ type: 'GET_STATE' })); }
+  if (result?.ok) { $('token').value = ''; showMessage('Saved locally. Pin a Websim project to sync.'); render(await send({ type: 'GET_STATE' })); refreshProjectLink(); }
   else showMessage(result?.message || 'Could not validate this token.', true);
 });
 
 $('branchMode').addEventListener('change', () => $('custom-branch-wrap').classList.toggle('hidden', $('branchMode').value !== 'custom'));
+$('advanced-logs').addEventListener('change', async () => {
+  const result = await send({ type: 'SET_DEBUG_MODE', enabled: $('advanced-logs').checked });
+  if (result?.ok) showMessage(result.advancedLogs ? 'Advanced logs enabled. Clear logs, then pin a project.' : 'Advanced logs disabled.');
+  else showMessage('Could not update advanced logging.', true);
+});
 $('copy-logs').addEventListener('click', copyLogs);
 $('clear-logs').addEventListener('click', async () => {
   await send({ type: 'CLEAR_LOGS' });
@@ -82,6 +120,7 @@ $('sync-current').addEventListener('click', async () => {
   const result = await send({ type: 'SYNC_CURRENT', tabId: tab?.id, url: tab?.url, title: tab?.title });
   showMessage(result?.message || 'Done.', !result?.ok);
   render(await send({ type: 'GET_STATE' }));
+  refreshProjectLink();
 });
 
-send({ type: 'GET_STATE' }).then(render);
+send({ type: 'GET_STATE' }).then((state) => { render(state); refreshProjectLink(); });

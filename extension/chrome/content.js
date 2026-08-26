@@ -32,14 +32,39 @@
     };
   }
 
+  function debug(event, detail = {}) {
+    api.runtime.sendMessage({ type: 'DEBUG_EVENT', event, detail }).catch(() => {});
+  }
+
+  function interactiveTarget(event) {
+    const path = event.composedPath?.() || [];
+    return path.find((node) => node?.matches?.('button, a, [role="button"], [data-project-id]')) ||
+      path.find((node) => node?.getAttribute && /\b(pin|pinned|bookmark|collection)\b/i.test(`${node.getAttribute('aria-label') || ''} ${node.getAttribute('title') || ''}`)) ||
+      event.target.closest?.('button, a, [role="button"], [data-project-id]');
+  }
+
+  function targetSummary(element) {
+    return {
+      tag: element?.tagName || null,
+      id: element?.id || null,
+      className: String(element?.className || '').slice(0, 180),
+      ariaLabel: element?.getAttribute?.('aria-label') || null,
+      title: element?.getAttribute?.('title') || null,
+      text: element?.textContent?.replace(/\s+/g, ' ').trim().slice(0, 180) || null,
+      href: element?.href ? String(element.href).split(/[?#]/)[0] : null,
+      dataAttributes: element?.dataset ? Object.fromEntries(Object.entries(element.dataset).slice(0, 12)) : {}
+    };
+  }
+
   function looksLikePin(element) {
     const text = [
       element.getAttribute?.('aria-label'),
       element.getAttribute?.('title'),
-      element.textContent
+      element.textContent,
+      element.className,
+      ...Object.values(element.dataset || {})
     ].filter(Boolean).join(' ').trim();
-    if (!text || text.length > 90) return false;
-    return /\b(pin|pinned|bookmark|save to collection)\b/i.test(text);
+    return text.length <= 240 && /\b(pin|pinned|bookmark|save\s+(?:to|this|project|version|collection)|collection)\b/i.test(text);
   }
 
   function showToast(message, kind = 'info') {
@@ -82,19 +107,39 @@
   }
 
   document.addEventListener('click', (event) => {
-    const target = event.target.closest?.('button, a, [role="button"], [data-project-id]');
-    if (!target || !looksLikePin(target) || Date.now() - lastPin < 1200) return;
+    const target = interactiveTarget(event);
+    if (!target) return;
+    const pinLike = looksLikePin(target);
+    debug('content.click.inspect', { ...targetSummary(target), pinLike, page: location.href.split(/[?#]/)[0] });
+    if (!pinLike) return;
+    if (Date.now() - lastPin < 1200) {
+      debug('content.pin.ignored', { reason: 'debounced', sincePreviousMs: Date.now() - lastPin, ...targetSummary(target) });
+      return;
+    }
     lastPin = Date.now();
     const payload = contextFor(target);
+    debug('content.pin.detected', payload);
     showToast('Syncing revision to GitHub…', 'loading');
-    api.runtime.sendMessage({ type: 'PIN_DETECTED', payload }).catch(() => {
+    api.runtime.sendMessage({ type: 'PIN_DETECTED', payload }).then((result) => {
+      debug('content.pin.message.response', { ok: Boolean(result?.ok), message: result?.message || null });
+    }).catch((error) => {
+      debug('content.pin.message.error', { message: error.message });
       showToast('Pin to GitHub: extension background unavailable', 'error');
     });
   }, true);
 
   api.runtime.onMessage.addListener((message) => {
+    if (message?.type === 'SYNC_STARTED') {
+      showToast('Syncing revision to GitHub…', 'loading');
+    }
     if (message?.type === 'SYNC_RESULT') {
+      debug('content.sync.result', { ok: Boolean(message.ok), message: message.message || null });
       showToast(message.ok ? `✓ ${message.message}` : `Pin to GitHub: ${message.message}`, message.ok ? 'success' : 'error');
     }
+  });
+  debug('content.ready', {
+    page: location.href.split(/[?#]/)[0],
+    isFrame: window.top !== window.self,
+    pinCandidates: [...document.querySelectorAll('button, a, [role="button"]')].filter(looksLikePin).slice(0, 12).map(targetSummary)
   });
 })();

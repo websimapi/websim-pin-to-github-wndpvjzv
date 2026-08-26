@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Pin to GitHub",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Commit the current Websim revision to GitHub when you pin a project.",
-  "permissions": ["storage", "notifications", "tabs", "clipboardWrite"],
+  "permissions": ["storage", "notifications", "tabs", "clipboardWrite", "webRequest"],
   "host_permissions": [
     "https://websim.com/*",
     "https://*.websim.com/*",
