@@ -468,7 +468,7 @@
     });
     const version = revision.version ?? revision.revision_number ?? project.version ?? '?';
     const title = String(project.title || revision.title || project.projectId || 'Websim project').replace(/[\r\n]+/g, ' ').slice(0, 120);
-    let commit = await githubRequest(`${basePath}/git/commits`, settings.token, {
+    const commit = await githubRequest(`${basePath}/git/commits`, settings.token, {
       method: 'POST',
       body: JSON.stringify({
         message: `v${version}: ${title}`,
@@ -484,62 +484,23 @@
       commitSha: commit.sha,
       parentSha: parentSha || null
     });
-    let refParentSha = parentSha;
-    let refExists = branchExists;
-    let refUpdated = false;
-    for (let attempt = 0; attempt < 3 && !refUpdated; attempt += 1) {
-      try {
-        if (refParentSha && refExists) {
-          await githubRequest(`${basePath}/git/refs/heads/${branch}`, settings.token, {
-            method: 'PATCH', body: JSON.stringify({ sha: commit.sha, force: false }),
-            headers: { 'Content-Type': 'application/json' }
-          });
-        } else {
-          await githubRequest(`${basePath}/git/refs`, settings.token, {
-            method: 'POST', body: JSON.stringify({ ref: `refs/heads/${target.branch}`, sha: commit.sha }),
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
-        refUpdated = true;
-      } catch (error) {
-        if (error.status !== 422 || !/fast.?forward/i.test(error.message) || attempt === 2) throw error;
-        const latestRef = await githubRequest(`${basePath}/git/ref/heads/${branch}`, settings.token);
-        const latestParentSha = latestRef.object?.sha || null;
-        if (!latestParentSha) throw error;
-        if (latestParentSha === commit.sha) {
-          refUpdated = true;
-          break;
-        }
-        const latestParent = await githubRequest(`${basePath}/git/commits/${latestParentSha}`, settings.token);
-        const retryTree = await githubRequest(`${basePath}/git/trees`, settings.token, {
-          method: 'POST',
-          body: JSON.stringify({ base_tree: latestParent.tree?.sha, tree: blobEntries }),
+    if (parentSha) {
+      if (branchExists) {
+        await githubRequest(`${basePath}/git/refs/heads/${branch}`, settings.token, {
+          method: 'PATCH', body: JSON.stringify({ sha: commit.sha, force: false }),
           headers: { 'Content-Type': 'application/json' }
         });
-        commit = await githubRequest(`${basePath}/git/commits`, settings.token, {
-          method: 'POST',
-          body: JSON.stringify({
-            message: `v${version}: ${title}`,
-            tree: retryTree.sha,
-            parents: [latestParentSha]
-          }),
+      } else {
+        await githubRequest(`${basePath}/git/refs`, settings.token, {
+          method: 'POST', body: JSON.stringify({ ref: `refs/heads/${target.branch}`, sha: commit.sha }),
           headers: { 'Content-Type': 'application/json' }
-        });
-        refParentSha = latestParentSha;
-        refExists = true;
-        await debugLog('git.ref.retry', {
-          owner: target.owner,
-          repo: target.repo,
-          branch: target.branch,
-          attempt: attempt + 1,
-          previousParentSha: parentSha || null,
-          latestParentSha,
-          retryCommitSha: commit.sha
         });
       }
-    }
-    if (!refUpdated) {
-      throw new Error('GitHub branch ref could not be updated after concurrent changes');
+    } else {
+      await githubRequest(`${basePath}/git/refs`, settings.token, {
+        method: 'POST', body: JSON.stringify({ ref: `refs/heads/${target.branch}`, sha: commit.sha }),
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
     await debugLog('git.branch.ready', {
       owner: target.owner,
