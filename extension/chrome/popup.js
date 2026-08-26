@@ -6,6 +6,15 @@ function send(message) {
   return new Promise((resolve) => api.runtime.sendMessage(message, resolve));
 }
 
+function activeTab() {
+  return new Promise((resolve) => api.tabs.query({ active: true, currentWindow: true }, (tabs) => resolve(tabs?.[0] || null)));
+}
+
+async function stateForActiveTab() {
+  const tab = await activeTab();
+  return send({ type: 'GET_STATE', tabId: tab?.id, url: tab?.url, title: tab?.title });
+}
+
 function render(state) {
   currentState = state;
   $('enabled').checked = state.enabled !== false;
@@ -37,9 +46,8 @@ async function refreshProjectLink() {
   metaNode.textContent = 'Checking the active tab';
   linkNode.hidden = true;
   try {
-    const tabs = await new Promise((resolve) => api.tabs.query({ active: true, currentWindow: true }, resolve));
-    const tab = tabs?.[0];
-    const result = await send({ type: 'GET_PROJECT_LINK', url: tab?.url, title: tab?.title });
+    const tab = await activeTab();
+    const result = await send({ type: 'GET_PROJECT_LINK', tabId: tab?.id, url: tab?.url, title: tab?.title });
     if (result?.status === 'not-configured') {
       repoNode.textContent = 'Connect GitHub first';
       metaNode.textContent = 'The linked repository appears after setup';
@@ -86,17 +94,15 @@ async function copyLogs() {
 
 $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const existing = currentState || {};
   const tokenInput = $('token').value.trim();
   const result = await send({ type: 'SAVE_SETTINGS', settings: {
-    ...existing,
-    token: tokenInput || existing.token || '',
+    token: tokenInput,
     visibility: $('visibility').value,
     branchMode: $('branchMode').value,
     customBranch: $('customBranch').value.trim(),
     enabled: $('enabled').checked
   }});
-  if (result?.ok) { $('token').value = ''; showMessage('Saved locally. Pin a Websim project to sync.'); render(await send({ type: 'GET_STATE' })); refreshProjectLink(); }
+  if (result?.ok) { $('token').value = ''; showMessage('Saved locally. Pin a Websim project to sync.'); render(await stateForActiveTab()); refreshProjectLink(); }
   else showMessage(result?.message || 'Could not validate this token.', true);
 });
 
@@ -108,19 +114,19 @@ $('advanced-logs').addEventListener('change', async () => {
 });
 $('copy-logs').addEventListener('click', copyLogs);
 $('clear-logs').addEventListener('click', async () => {
-  await send({ type: 'CLEAR_LOGS' });
-  render(await send({ type: 'GET_STATE' }));
+  const tab = await activeTab();
+  await send({ type: 'CLEAR_LOGS', tabId: tab?.id, url: tab?.url, title: tab?.title });
+  render(await stateForActiveTab());
   showMessage('Diagnostic logs cleared.');
 });
 
 $('sync-current').addEventListener('click', async () => {
   showMessage('Reading the current Websim project…');
-  const tabs = await new Promise((resolve) => api.tabs.query({ active: true, currentWindow: true }, resolve));
-  const tab = tabs?.[0];
+  const tab = await activeTab();
   const result = await send({ type: 'SYNC_CURRENT', tabId: tab?.id, url: tab?.url, title: tab?.title });
   showMessage(result?.message || 'Done.', !result?.ok);
-  render(await send({ type: 'GET_STATE' }));
+  render(await stateForActiveTab());
   refreshProjectLink();
 });
 
-send({ type: 'GET_STATE' }).then((state) => { render(state); refreshProjectLink(); });
+stateForActiveTab().then((state) => { render(state); refreshProjectLink(); });

@@ -4,7 +4,8 @@
   const WS_API = 'https://websim.com/api/v1';
   const defaults = {
     enabled: true, token: '', owner: '', branchMode: 'main', customBranch: '',
-    visibility: 'private', lastEvents: [], syncedVersions: {}, projectMap: {}, debugLogs: [], advancedLogs: false
+    visibility: 'private', lastEvents: [], syncedVersions: {}, projectMap: {}, debugLogs: [],
+    advancedLogs: true, advancedLogsConfigured: false
   };
 
   const storageGet = (keys) => new Promise((resolve) => api.storage.local.get(keys, resolve));
@@ -13,6 +14,8 @@
   const trackedWebsimRequests = new Map();
   const syncInFlight = new Set();
   const activeSyncs = new Set();
+  const projectLogScopes = new Map();
+  const repoLogScopes = new Map();
 
   function normalizedTabId(tabId) {
     return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
@@ -33,8 +36,35 @@
     return `${normalizedTabId(details.tabId) ?? 'background'}:${details.requestId}`;
   }
 
+  function rememberProjectLogScope(projectId, tabId) {
+    if (projectId) projectLogScopes.set(String(projectId), normalizedTabId(tabId));
+  }
+
+  function rememberRepoLogScope(owner, repo, projectId, tabId) {
+    if (owner && repo && projectId) repoLogScopes.set(`${owner}/${repo}`.toLowerCase(), { projectId: String(projectId), tabId: normalizedTabId(tabId) });
+  }
+
+  function scopedLogDetail(detail = {}) {
+    let projectId = detail.projectId || null;
+    let tabId = normalizedTabId(detail.tabId);
+    const path = String(detail.path || detail.url || detail.page || detail.senderUrl || '');
+    const projectMatch = path.match(/\/projects\/([^/?]+)/i);
+    if (!projectId && projectMatch) projectId = decodeURIComponent(projectMatch[1]);
+    const repoMatch = path.match(/\/repos\/([^/]+)\/([^/?]+)/i);
+    const repoKey = repoMatch ? `${decodeURIComponent(repoMatch[1])}/${decodeURIComponent(repoMatch[2])}`.toLowerCase() :
+      detail.owner && detail.repo ? `${detail.owner}/${detail.repo}`.toLowerCase() : null;
+    const repoScope = repoKey ? repoLogScopes.get(repoKey) : null;
+    if (!projectId && repoScope) projectId = repoScope.projectId;
+    if (projectId && tabId === null) tabId = projectLogScopes.get(String(projectId)) ?? repoScope?.tabId ?? null;
+    return {
+      ...detail,
+      ...(projectId ? { projectId: String(projectId) } : {}),
+      ...(tabId !== null ? { tabId } : {})
+    };
+  }
+
   function debugLog(event, detail = {}) {
-    const entry = { at: new Date().toISOString(), event, ...detail };
+    const entry = { at: new Date().toISOString(), event, ...scopedLogDetail(detail) };
     logQueue = logQueue.then(async () => {
       const stored = await storageGet({ debugLogs: [] });
       await storageSet({ debugLogs: [...(stored.debugLogs || []), entry].slice(-160) });
@@ -184,6 +214,10 @@
 
   async function config() {
     const stored = await storageGet(defaults);
+    if (stored.advancedLogsConfigured !== true) {
+      await storageSet({ advancedLogs: true, advancedLogsConfigured: true });
+      return { ...defaults, ...stored, advancedLogs: true, advancedLogsConfigured: true };
+    }
     return { ...defaults, ...stored };
   }
 
@@ -264,6 +298,81 @@
     } catch {
       return null;
     }
+  }
+
+  function projectIdForLog(entry, projectMap = {}) {
+    if (entry?.projectId) return String(entry.projectId);
+    const path = String(entry?.path || entry?.url || '');
+    const projectMatch = path.match(/\/projects\/([^/?]+)/i);
+    if (projectMatch) return decodeURIComponent(projectMatch[1]);
+    const repoMatch = path.match(/\/repos\/[^/]+\/([^/?]+)/i);
+    if (!repoMatch) return null;
+    const repo = decodeURIComponent(repoMatch[1]).toLowerCase();
+    return Object.entries(projectMap).find(([, mapped]) => String(mapped?.repo || '').toLowerCase() === repo)?.[0] || null;
+  }
+
+  function belongsToContext(entry, projectId, tabId, projectMap) {
+    if (projectIdForLog(entry, projectMap) !== String(projectId || '')) return false;
+    const entryTabId = normalizedTabId(entry?.tabId);
+    const activeTabId = normalizedTabId(tabId);
+    return entryTabId === null || activeTabId === null || entryTabId === activeTabId;
+  }
+
+  function logsForProject(logs, projectId, tabId, projectMap) {
+    if (!projectId) return [];
+    return (logs || []).filter((entry) => belongsToContext(entry, projectId, tabId, projectMap));
+  }
+
+  function eventsForProject(events, projectId, tabId) {
+    if (!projectId) return [];
+    return (events || []).filter((entry) => belongsToContext(entry, projectId, tabId, {}));
+  }
+
+  async function stateForContext(message = {}) {
+    const stored = await config();
+    const projectId = await resolveProjectId(message);
+    const tabId = normalizedTabId(message.tabId);
+    return {
+      ...stored,
+      activeTabId: tabId,
+      activeProjectId: projectId,
+      lastEvents: eventsForProject(stored.lastEvents, projectId, tabId),
+      debugLogs: logsForProject(stored.debugLogs, projectId, tabId, stored.projectMap),
+      token: '',
+      hasToken: Boolean(stored.token)
+    };
+  }
+
+  async function clearLogsForContext(message = {}) {
+    const stored = await config();
+    const projectId = await resolveProjectId(message);
+    if (!projectId) return;
+    const tabId = normalizedTabId(message.tabId);
+    await storageSet({
+      debugLogs: (stored.debugLogs || []).filter((entry) => !belongsToContext(entry, projectId, tabId, stored.projectMap))
+    });
+  }
+
+  async function autoSyncNewProject(payload, tabId) {
+    const settings = await config();
+    if (!settings.enabled || !settings.token) return { ok: true, skipped: 'not-configured' };
+    let projectId = null;
+    for (let attempt = 0; attempt < 3 && !projectId; attempt += 1) {
+      projectId = await resolveProjectId(payload);
+      if (!projectId && attempt < 2) {
+        await debugLog('sync.page-ready.retry', { tabId: normalizedTabId(tabId), attempt: attempt + 1, reason: 'project-not-found' });
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    if (!projectId) return { ok: true, skipped: 'project-not-found' };
+    if (settings.projectMap?.[projectId]) {
+      await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'project-already-linked' });
+      return { ok: true, skipped: 'project-already-linked', projectId };
+    }
+    rememberProjectLogScope(projectId, tabId);
+    setSyncIndicator(true, tabId);
+    if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type: 'SYNC_STARTED', source: 'project-page-ready' }).catch(() => {});
+    return sync({ ...payload, projectId }, tabId);
   }
 
   async function currentRevision(projectId) {
@@ -595,6 +704,7 @@
     try {
       projectId = await resolveProjectId(payload);
       if (!projectId) throw new Error('Could not identify the pinned project');
+      rememberProjectLogScope(projectId, tabId);
       const runKey = syncKey(projectId, tabId);
       if (syncInFlight.has(runKey)) {
         await debugLog('sync.skipped-in-flight', { projectId, tabId: normalizedTabId(tabId) });
@@ -608,6 +718,7 @@
       await debugLog('websim.revision.selected', { projectId, version });
       stage = 'resolve-or-create-repository';
       const target = await ensureRepository({ ...payload, projectId }, revision, settings);
+      rememberRepoLogScope(target.owner, target.repo, projectId, tabId);
       const versionKey = `${target.owner}/${target.repo}:${projectId}:${target.branch}`;
       if (String(settings.syncedVersions?.[versionKey]) === String(version)) {
         await debugLog('sync.skipped-duplicate', { projectId, version, owner: target.owner, repo: target.repo, branch: target.branch });
@@ -622,7 +733,7 @@
         owner: target.owner,
         projectMap: { ...(stored.projectMap || {}), [projectId]: { repo: target.repo, branch: target.branch } }
       });
-      await remember({ title: commit.title, version: commit.version, projectId, repo: target.repo, branch: target.branch, sha: commit.sha, url: commit.url, at: Date.now() }, versionKey);
+      await remember({ title: commit.title, version: commit.version, projectId, tabId: normalizedTabId(tabId), repo: target.repo, branch: target.branch, sha: commit.sha, url: commit.url, at: Date.now() }, versionKey);
       await debugLog('sync.complete', { projectId, version, owner: target.owner, repo: target.repo, branch: target.branch, commitSha: commit.sha });
       return { ok: true, message: `${target.created ? 'Created repo and committed' : 'Committed'} v${commit.version} to ${target.owner}/${target.repo} · ${target.branch}`, commit };
     } catch (error) {
@@ -640,6 +751,7 @@
 
   async function triggerAutoSync(details, mutation, body, beforeState) {
     const tabId = Number.isInteger(details.tabId) && details.tabId >= 0 ? details.tabId : null;
+    rememberProjectLogScope(mutation.projectId, tabId);
     await debugLog('pin.candidate.response', { tabId, projectId: mutation.projectId, status: details.statusCode, body });
     if (details.statusCode < 200 || details.statusCode >= 300) return;
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -696,12 +808,14 @@
     if (!settings.token) return { ok: true, status: 'not-configured' };
     const projectId = await resolveProjectId(payload);
     if (!projectId) return { ok: true, status: 'not-websim' };
+    rememberProjectLogScope(projectId, payload.tabId);
     const mapped = settings.projectMap?.[projectId];
     const user = await githubRequest('/user', settings.token);
     const generatedName = generatedRepoName(projectId, payload?.title);
     const names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
     const repository = await findExistingRepository(user.login, settings.token, projectId, names);
     const repo = repository?.name || generatedName;
+    rememberRepoLogScope(user.login, repo, projectId, payload.tabId);
     const mappedRepository = mapped?.repo && repo.toLowerCase() === String(mapped.repo).toLowerCase();
     const branch = mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository || {});
     await debugLog('repository.link.preview', { projectId, owner: user.login, repo, branch, status: repository ? 'linked' : 'planned' });
@@ -723,6 +837,7 @@
         }
         config().then((state) => state.advancedLogs && debugLog('network.request', {
           requestId: details.requestId,
+          tabId: normalizedTabId(details.tabId),
           method: details.method,
           type: details.type,
           url,
@@ -743,6 +858,7 @@
         }
         config().then((state) => state.advancedLogs && debugLog('network.response', {
           requestId: details.requestId,
+          tabId: normalizedTabId(details.tabId),
           status: details.statusCode,
           type: details.type,
           url
@@ -758,6 +874,7 @@
         }
         config().then((state) => state.advancedLogs && debugLog('network.error', {
           requestId: details.requestId,
+          tabId: normalizedTabId(details.tabId),
           error: details.error,
           type: details.type,
           url
@@ -771,11 +888,11 @@
 
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'GET_STATE') {
-      config().then((stored) => sendResponse({ ...stored, token: '', hasToken: Boolean(stored.token) }));
+      stateForContext(message).then(sendResponse).catch(() => stateForContext().then(sendResponse));
       return true;
     }
     if (message?.type === 'GET_LOGS') {
-      config().then((stored) => sendResponse({ logs: stored.debugLogs || [] }));
+      stateForContext(message).then((state) => sendResponse({ logs: state.debugLogs || [], activeProjectId: state.activeProjectId, activeTabId: state.activeTabId }));
       return true;
     }
     if (message?.type === 'GET_PROJECT_LINK') {
@@ -783,7 +900,19 @@
       return true;
     }
     if (message?.type === 'CLEAR_LOGS') {
-      storageSet({ debugLogs: [] }).then(() => sendResponse({ ok: true }));
+      clearLogsForContext(message).then(() => sendResponse({ ok: true }));
+      return true;
+    }
+    if (message?.type === 'PROJECT_PAGE_READY') {
+      const tabId = normalizedTabId(sender.tab?.id);
+      autoSyncNewProject(message.payload || message, tabId).then((result) => {
+        if (!result?.skipped) notify(tabId, result);
+        sendResponse(result);
+      }).catch((error) => {
+        const result = { ok: false, message: error.message };
+        notify(tabId, result);
+        sendResponse(result);
+      });
       return true;
     }
     if (message?.type === 'SET_DEBUG_MODE') {
@@ -793,7 +922,9 @@
     if (message?.type === 'DEBUG_EVENT') {
       config().then((stored) => {
         if (!stored.advancedLogs) return sendResponse({ ok: true, recorded: false });
-        debugLog(message.event || 'content.debug', safeDebugDetail(message.detail)).then(() => sendResponse({ ok: true, recorded: true }));
+        const detail = safeDebugDetail(message.detail);
+        if (sender.tab?.id !== undefined) detail.tabId = normalizedTabId(sender.tab.id);
+        debugLog(message.event || 'content.debug', detail).then(() => sendResponse({ ok: true, recorded: true }));
       });
       return true;
     }

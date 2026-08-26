@@ -2,6 +2,8 @@ const api = globalThis.browser || globalThis.chrome;
 const $ = (id) => document.getElementById(id);
 let currentState = null;
 function send(message) { return new Promise((resolve) => api.runtime.sendMessage(message, resolve)); }
+function activeTab() { return new Promise((resolve) => api.tabs.query({ active:true, currentWindow:true }, (tabs) => resolve(tabs?.[0] || null))); }
+async function stateForActiveTab() { const tab=await activeTab(); return send({ type:'GET_STATE', tabId:tab?.id, url:tab?.url, title:tab?.title }); }
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function render(state) {
   currentState = state;
@@ -23,8 +25,8 @@ async function refreshProjectLink() {
   const repoNode=$('linked-repo'), metaNode=$('linked-repo-meta'), linkNode=$('linked-repo-url');
   repoNode.textContent='Detecting Websim project…'; metaNode.textContent='Checking the active tab'; linkNode.hidden=true;
   try {
-    const tabs=await new Promise((resolve) => api.tabs.query({ active:true, currentWindow:true }, resolve)), tab=tabs?.[0];
-    const result=await send({ type:'GET_PROJECT_LINK', url:tab?.url, title:tab?.title });
+    const tab=await activeTab();
+    const result=await send({ type:'GET_PROJECT_LINK', tabId:tab?.id, url:tab?.url, title:tab?.title });
     if (result?.status === 'not-configured') { repoNode.textContent='Connect GitHub first'; metaNode.textContent='The linked repository appears after setup'; return; }
     if (result?.status === 'not-websim') { repoNode.textContent='No Websim project detected'; metaNode.textContent='Open a Websim project in the active tab'; return; }
     if (!result?.ok) throw new Error(result?.message || 'Could not inspect the project link');
@@ -48,19 +50,19 @@ async function copyLogs() {
 }
 $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const existing = currentState || {}, tokenInput = $('token').value.trim();
-  const result = await send({ type:'SAVE_SETTINGS', settings:{ ...existing, token:tokenInput || existing.token || '', visibility:$('visibility').value, branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked } });
-  if (result?.ok) { $('token').value=''; message('Saved locally. Pin a Websim project to sync.'); render(await send({ type:'GET_STATE' })); refreshProjectLink(); }
+  const tokenInput = $('token').value.trim();
+  const result = await send({ type:'SAVE_SETTINGS', settings:{ token:tokenInput, visibility:$('visibility').value, branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked } });
+  if (result?.ok) { $('token').value=''; message('Saved locally. Pin a Websim project to sync.'); render(await stateForActiveTab()); refreshProjectLink(); }
   else message(result?.message || 'Could not validate this token.', true);
 });
 $('branchMode').addEventListener('change', () => $('custom-branch-wrap').classList.toggle('hidden', $('branchMode').value !== 'custom'));
 $('advanced-logs').addEventListener('change', async () => { const result = await send({ type:'SET_DEBUG_MODE', enabled:$('advanced-logs').checked }); if (result?.ok) message(result.advancedLogs ? 'Advanced logs enabled. Clear logs, then pin a project.' : 'Advanced logs disabled.'); else message('Could not update advanced logging.', true); });
 $('copy-logs').addEventListener('click', copyLogs);
-$('clear-logs').addEventListener('click', async () => { await send({ type:'CLEAR_LOGS' }); render(await send({ type:'GET_STATE' })); message('Diagnostic logs cleared.'); });
+$('clear-logs').addEventListener('click', async () => { const tab=await activeTab(); await send({ type:'CLEAR_LOGS', tabId:tab?.id, url:tab?.url, title:tab?.title }); render(await stateForActiveTab()); message('Diagnostic logs cleared.'); });
 $('sync-current').addEventListener('click', async () => {
   message('Reading the current Websim project…');
-  const tabs = await new Promise((resolve) => api.tabs.query({ active:true, currentWindow:true }, resolve)), tab = tabs?.[0];
+  const tab = await activeTab();
   const result = await send({ type:'SYNC_CURRENT', tabId:tab?.id, url:tab?.url, title:tab?.title });
-  message(result?.message || 'Done.', !result?.ok); render(await send({ type:'GET_STATE' })); refreshProjectLink();
+  message(result?.message || 'Done.', !result?.ok); render(await stateForActiveTab()); refreshProjectLink();
 });
-send({ type:'GET_STATE' }).then((state) => { render(state); refreshProjectLink(); });
+stateForActiveTab().then((state) => { render(state); refreshProjectLink(); });

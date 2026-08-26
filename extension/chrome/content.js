@@ -32,6 +32,18 @@
     };
   }
 
+  function pageReadyContext() {
+    const frame = document.querySelector('iframe[src*=".c.websim.com"]');
+    const directProjectId = projectIdFromUrl(location.href) || projectIdFromUrl(frame?.src);
+    const isProjectRoute = /^\/@[^/]+\/[^/]+/.test(location.pathname);
+    if (!directProjectId && !isProjectRoute) return null;
+    return {
+      projectId: directProjectId || null,
+      url: location.href,
+      title: document.title.replace(/\s*[|·—-]\s*Websim.*$/i, '').trim()
+    };
+  }
+
   function debug(event, detail = {}) {
     api.runtime.sendMessage({ type: 'DEBUG_EVENT', event, detail }).catch(() => {});
   }
@@ -142,4 +154,11 @@
     isFrame: window.top !== window.self,
     pinCandidates: [...document.querySelectorAll('button, a, [role="button"]')].filter(looksLikePin).slice(0, 12).map(targetSummary)
   });
+  window.setTimeout(() => {
+    const payload = pageReadyContext();
+    if (!payload) return;
+    api.runtime.sendMessage({ type: 'PROJECT_PAGE_READY', payload }).then((result) => {
+      if (!result?.skipped) debug('content.page-ready.response', { ok: Boolean(result?.ok), message: result?.message || null });
+    }).catch((error) => debug('content.page-ready.error', { message: error.message }));
+  }, 250);
 })();
