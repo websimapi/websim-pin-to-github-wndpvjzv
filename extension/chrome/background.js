@@ -13,6 +13,7 @@
   let logQueue = Promise.resolve();
   const trackedWebsimRequests = new Map();
   const syncInFlight = new Set();
+  const pendingSyncs = new Map();
   const activeSyncs = new Set();
   const projectLogScopes = new Map();
   const repoLogScopes = new Map();
@@ -423,14 +424,18 @@
     if (!projectId) return;
     const key = readinessRetryKey(projectId, tabId);
     const pending = readinessRetryTimers.get(key);
-    if (pending?.timer) return;
+    if (pending?.timer) {
+      pending.payload = { ...pending.payload, ...payload };
+      return;
+    }
     const attempt = pending?.attempt || 0;
     const delay = readinessRetryDelays[Math.min(attempt, readinessRetryDelays.length - 1)];
     const retry = {
       attempt: attempt + 1,
+      payload: { ...payload },
       timer: setTimeout(() => {
-        readinessRetryTimers.set(key, { attempt: retry.attempt, timer: null });
-        autoSyncNewProject(payload, tabId).then((result) => {
+        readinessRetryTimers.set(key, { attempt: retry.attempt, payload: retry.payload, timer: null });
+        autoSyncNewProject(retry.payload, tabId).then((result) => {
           if (!result?.skipped) notify(tabId, result);
         }).catch((error) => {
           debugLog('sync.page-ready.failed', {
@@ -470,6 +475,19 @@
       const linked = settings.projectMap?.[projectId];
       const projectResponse = await wsJson(`/projects/${encodeURIComponent(projectId)}`);
       const { project, revision, version, ready } = projectReadiness(projectResponse);
+      const requestedVersion = payload?.requestedVersion;
+      if (requestedVersion !== undefined && requestedVersion !== null &&
+        (version === null || Number(version) < Number(requestedVersion))) {
+        await debugLog('sync.page-ready.waiting', {
+          projectId,
+          tabId: normalizedTabId(tabId),
+          reason: 'requested-version-not-current',
+          version,
+          requestedVersion
+        });
+        scheduleReadinessRetry({ ...payload, projectId }, tabId);
+        return { ok: true, skipped: 'project-not-ready', projectId };
+      }
       if (!ready) {
         await debugLog('sync.page-ready.skipped', {
           projectId,
@@ -881,12 +899,14 @@
       rememberProjectLogScope(projectId, tabId);
       const runKey = syncKey(projectId, tabId);
       if (syncInFlight.has(runKey)) {
-        await debugLog('sync.skipped-in-flight', { projectId, tabId: normalizedTabId(tabId) });
+        pendingSyncs.set(runKey, { payload: { ...payload, projectId }, tabId });
+        await debugLog('sync.queued-in-flight', { projectId, tabId: normalizedTabId(tabId) });
         return {
           ok: true,
           inProgress: true,
           skipped: 'in-progress',
-          message: 'This project is already being synced'
+          queued: true,
+          message: 'This project is already being synced; the newest revision will follow'
         };
       }
       syncInFlight.add(runKey);
@@ -940,6 +960,18 @@
         syncInFlight.delete(runKey);
         activeSyncs.delete(runKey);
         setSyncIndicator(activeSyncForTab(tabId), tabId);
+        const pending = pendingSyncs.get(runKey);
+        if (pending) {
+          pendingSyncs.delete(runKey);
+          setTimeout(() => {
+            debugLog('sync.pending.recheck', { projectId, tabId: normalizedTabId(tabId) });
+            autoSyncNewProject(pending.payload, pending.tabId).then((result) => {
+              if (!result?.skipped) notify(pending.tabId, result);
+            }).catch((error) => {
+              debugLog('sync.page-ready.failed', { tabId: normalizedTabId(pending.tabId), projectId, message: error.message });
+            });
+          }, 0);
+        }
       }
     }
   }
@@ -980,7 +1012,12 @@
     if (tabId !== null) {
       try { tab = await api.tabs.get(tabId); } catch {}
     }
-    const payload = { projectId: mutation.projectId, url: tab?.url || details.documentUrl || `https://websim.com/p/${mutation.projectId}`, title: null };
+    const payload = {
+      projectId: mutation.projectId,
+      url: tab?.url || details.documentUrl || `https://websim.com/p/${mutation.projectId}`,
+      title: null,
+      requestedVersion: afterState.version
+    };
     await debugLog('pin.autosync.trigger', { tabId, ...payload });
     setSyncIndicator(true, tabId);
     if (tabId !== null) api.tabs.sendMessage(tabId, { type: 'SYNC_STARTED', source: 'project-patch' }).catch(() => {});
