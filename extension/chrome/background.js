@@ -17,6 +17,8 @@
   const projectLogScopes = new Map();
   const repoLogScopes = new Map();
   const automaticSyncChecks = new Set();
+  const readinessRetryTimers = new Map();
+  const readinessRetryDelays = [1000, 2000, 4000, 8000, 15000, 30000, 60000];
 
   function normalizedTabId(tabId) {
     return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
@@ -397,6 +399,59 @@
     };
   }
 
+  function readinessRetryKey(projectId, tabId) {
+    return syncKey(projectId, tabId);
+  }
+
+  function cancelReadinessRetry(projectId, tabId) {
+    const key = readinessRetryKey(projectId, tabId);
+    const retry = readinessRetryTimers.get(key);
+    if (!retry) return;
+    clearTimeout(retry.timer);
+    readinessRetryTimers.delete(key);
+  }
+
+  function scheduleReadinessRetry(payload, tabId) {
+    const projectId = payload?.projectId;
+    if (!projectId) return;
+    const key = readinessRetryKey(projectId, tabId);
+    const pending = readinessRetryTimers.get(key);
+    if (pending?.timer) return;
+    const attempt = pending?.attempt || 0;
+    const delay = readinessRetryDelays[attempt];
+    if (delay === undefined) {
+      debugLog('sync.page-ready.retry.exhausted', {
+        projectId,
+        tabId: normalizedTabId(tabId),
+        attempts: readinessRetryDelays.length
+      });
+      return;
+    }
+    const retry = {
+      attempt: attempt + 1,
+      timer: setTimeout(() => {
+        readinessRetryTimers.set(key, { attempt: retry.attempt, timer: null });
+        autoSyncNewProject(payload, tabId).then((result) => {
+          if (!result?.skipped) notify(tabId, result);
+        }).catch((error) => {
+          debugLog('sync.page-ready.failed', {
+            tabId: normalizedTabId(tabId),
+            projectId,
+            message: error.message
+          });
+        });
+      }, delay)
+    };
+    readinessRetryTimers.set(key, retry);
+    debugLog('sync.page-ready.retry.scheduled', {
+      projectId,
+      tabId: normalizedTabId(tabId),
+      attempt: retry.attempt,
+      delayMs: delay,
+      reason: 'project-not-ready'
+    });
+  }
+
   async function autoSyncNewProject(payload, tabId) {
     const settings = await config();
     if (!settings.enabled || !settings.token) return { ok: true, skipped: 'not-configured' };
@@ -425,10 +480,13 @@
           version,
           draft: revision.draft ?? null
         });
+        scheduleReadinessRetry({ ...payload, projectId }, tabId);
         return { ok: true, skipped: 'project-not-ready', projectId };
       }
+      cancelReadinessRetry(projectId, tabId);
       if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) {
         await debugLog('sync.page-ready.skipped', { projectId, tabId: normalizedTabId(tabId), reason: 'version-already-synced', version });
+        cancelReadinessRetry(projectId, tabId);
         return { ok: true, skipped: 'version-already-synced', projectId };
       }
       const readyPayload = {

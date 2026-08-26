@@ -11,6 +11,8 @@
   const projectLogScopes = new Map();
   const repoLogScopes = new Map();
   const automaticSyncChecks = new Set();
+  const readinessRetryTimers = new Map();
+  const readinessRetryDelays = [1000, 2000, 4000, 8000, 15000, 30000, 60000];
   function normalizedTabId(tabId) { return Number.isInteger(tabId) && tabId >= 0 ? tabId : null; }
   function syncKey(projectId, tabId) { const scope = normalizedTabId(tabId); return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`; }
   function activeSyncForTab(tabId) { const scope = normalizedTabId(tabId), prefix = `${scope === null ? 'background' : `tab:${scope}`}:`; return [...activeSyncs].some((key) => key.startsWith(prefix)); }
@@ -178,6 +180,27 @@
     const version=project.current_version ?? project.currentVersion ?? revision.version ?? revision.revision_number ?? null;
     return { project, revision, version, ready:Boolean(String(project.slug || '').trim()) && version !== null && revision.draft !== true };
   }
+  function readinessRetryKey(projectId, tabId) { return syncKey(projectId, tabId); }
+  function cancelReadinessRetry(projectId, tabId) {
+    const key=readinessRetryKey(projectId, tabId), retry=readinessRetryTimers.get(key);
+    if (!retry) return;
+    clearTimeout(retry.timer);
+    readinessRetryTimers.delete(key);
+  }
+  function scheduleReadinessRetry(payload, tabId) {
+    const projectId=payload?.projectId;
+    if (!projectId) return;
+    const key=readinessRetryKey(projectId, tabId), pending=readinessRetryTimers.get(key);
+    if (pending?.timer) return;
+    const attempt=pending?.attempt || 0, delay=readinessRetryDelays[attempt];
+    if (delay === undefined) { debugLog('sync.page-ready.retry.exhausted', { projectId, tabId:normalizedTabId(tabId), attempts:readinessRetryDelays.length }); return; }
+    const retry={ attempt:attempt + 1, timer:setTimeout(() => {
+      readinessRetryTimers.set(key, { attempt:retry.attempt, timer:null });
+      autoSyncNewProject(payload, tabId).then((result) => { if (!result?.skipped) notify(tabId,result); }).catch((error) => debugLog('sync.page-ready.failed', { tabId:normalizedTabId(tabId), projectId, message:error.message }));
+    }, delay) };
+    readinessRetryTimers.set(key, retry);
+    debugLog('sync.page-ready.retry.scheduled', { projectId, tabId:normalizedTabId(tabId), attempt:retry.attempt, delayMs:delay, reason:'project-not-ready' });
+  }
   async function autoSyncNewProject(payload, tabId) {
     const settings=await config(); if (!settings.enabled || !settings.token) return { ok:true, skipped:'not-configured' };
     let projectId=null;
@@ -193,10 +216,12 @@
       const { project, revision, version, ready }=projectReadiness(projectResponse);
       if (!ready) {
         await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'project-not-ready', slug:project.slug || null, version, draft:revision.draft ?? null });
+        scheduleReadinessRetry({ ...payload, projectId }, tabId);
         return { ok:true, skipped:'project-not-ready', projectId };
       }
+      cancelReadinessRetry(projectId, tabId);
       const linked=settings.projectMap?.[projectId];
-      if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'version-already-synced', version }); return { ok:true, skipped:'version-already-synced', projectId }; }
+      if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'version-already-synced', version }); cancelReadinessRetry(projectId, tabId); return { ok:true, skipped:'version-already-synced', projectId }; }
       const readyPayload={ ...payload, projectId, title:payload.title || project.title || null, slug:project.slug || null };
       rememberProjectLogScope(projectId, tabId); setSyncIndicator(true, tabId);
       if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type:'SYNC_STARTED', source:'project-page-ready' }).catch(() => {});
