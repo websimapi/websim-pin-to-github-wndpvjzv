@@ -166,7 +166,7 @@
   }
 
   async function jsonRequest(url, options = {}) {
-    const response = await fetch(url, { ...options, cache: options.cache || 'no-store', headers: {
+    const response = await fetch(url, { ...options, headers: {
       Accept: 'application/vnd.github+json',
       ...(options.headers || {})
     }});
