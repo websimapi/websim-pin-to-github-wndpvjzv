@@ -51,7 +51,7 @@
   function setSyncIndicator(active) { const action=api.action || api.browserAction; if (!action) return; Promise.resolve(action.setBadgeText?.({ text:active ? '…' : '' })).catch(() => {}); Promise.resolve(action.setBadgeBackgroundColor?.({ color:active ? '#d9ee65' : '#11131a' })).catch(() => {}); Promise.resolve(action.setTitle?.({ title:active ? 'Pin to GitHub · syncing…' : 'Pin to GitHub' })).catch(() => {}); }
   async function config() { return { ...defaults, ...(await storageGet(defaults)) }; }
   async function request(url, options = {}) {
-    const response = await fetch(url, { ...options, headers:{ Accept:'application/vnd.github+json', ...(options.headers || {}) } });
+    const response = await fetch(url, { ...options, cache: options.cache || 'no-store', headers:{ Accept:'application/vnd.github+json', ...(options.headers || {}) } });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) { const error = new Error(data.message || data?.error?.message || data?.error || `Request failed (${response.status})`); error.status = response.status; error.url = url; throw error; }
     return data;
