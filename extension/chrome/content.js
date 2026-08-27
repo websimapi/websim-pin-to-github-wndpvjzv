@@ -57,10 +57,15 @@
       if (event.source !== window || event.origin !== location.origin || data?.source !== 'pin-to-github' || data?.type !== 'WEBSIM_SESSION') return;
       api.runtime.sendMessage({ type: 'WEBSIM_SESSION', payload: data }).catch((error) => debug('content.session.error', { message: error.message }));
     });
-    const script = document.createElement('script');
-    script.src = api.runtime.getURL('page-bridge.js');
-    script.onload = script.onerror = () => script.remove();
-    (document.head || document.documentElement).appendChild(script);
+    api.runtime.sendMessage({ type: 'REQUEST_WEBSIM_SESSION' }).then((result) => {
+      // Firefox versions without the main-world scripting API use the
+      // web-accessible bridge as a fallback.
+      if (result?.injected) return;
+      const script = document.createElement('script');
+      script.src = api.runtime.getURL('page-bridge.js');
+      script.onload = script.onerror = () => script.remove();
+      (document.head || document.documentElement).appendChild(script);
+    }).catch((error) => debug('content.session.bridge.error', { message: error.message }));
   }
 
   function interactiveTarget(event) {

@@ -19,6 +19,8 @@
   const repoLogScopes = new Map();
   const automaticSyncChecks = new Set();
   const readinessRetryTimers = new Map();
+  const authorizedProjectMutations = new Map();
+  const mutationAuthorizationWindowMs = 2 * 60 * 1000;
   // GitHub credentials do not imply ownership of a Websim project. Session
   // identity is tracked per tab and checked before every possible GitHub write.
   const websimSessions = new Map();
@@ -29,6 +31,14 @@
 
   function normalizedTabId(tabId) {
     return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
+  }
+
+  function isFirstPartyWebsimUrl(value) {
+    try {
+      return new URL(value || '').hostname === 'websim.com';
+    } catch {
+      return false;
+    }
   }
 
   function normalizedWebsimUser(user) {
@@ -65,9 +75,75 @@
     return { ok: true, user };
   }
 
+  async function requestWebsimSession(tabId) {
+    const scope = normalizedTabId(tabId);
+    if (scope === null || !api.scripting?.executeScript) return { injected: false };
+    await api.scripting.executeScript({
+      target: { tabId: scope },
+      world: 'MAIN',
+      func: () => {
+        function remixSessionUser(runtimeUser) {
+          const root = window.__remixContext?.state?.loaderData?.root;
+          const auth = root?.authUser;
+          const profile = root?.user;
+          const user = {
+            id: auth?.id ?? profile?.id ?? runtimeUser?.id,
+            email: auth?.email ?? runtimeUser?.email,
+            username: profile?.username ?? runtimeUser?.username,
+            avatar_url: profile?.avatar_url ?? runtimeUser?.avatar_url
+          };
+          return user.id || user.username ? user : null;
+        }
+
+        let attempts = 0;
+        const report = async () => {
+          try {
+            const [runtimeUser, project] = await Promise.all([
+              window.websim?.getUser ? window.websim.getUser() : null,
+              window.websim?.getCurrentProject ? window.websim.getCurrentProject().catch(() => null) : null
+            ]);
+            const user = remixSessionUser(runtimeUser);
+            window.postMessage({
+              source: 'pin-to-github',
+              type: 'WEBSIM_SESSION',
+              user: user ? { id: user.id, username: user.username } : null,
+              projectId: project?.id || null,
+              url: location.href
+            }, location.origin);
+            return Boolean(user);
+          } catch {
+            return false;
+          }
+        };
+        const timer = setInterval(async () => {
+          attempts += 1;
+          if (await report() || attempts >= 20) clearInterval(timer);
+        }, 300);
+      }
+    });
+    await debugLog('websim.session.bridge.injected', { tabId: scope });
+    return { injected: true };
+  }
+
   function syncKey(projectId, tabId) {
     const scope = normalizedTabId(tabId);
     return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`;
+  }
+
+  function authorizeProjectMutation(projectId, tabId) {
+    authorizedProjectMutations.set(syncKey(projectId, tabId), Date.now());
+  }
+
+  function mutationAuthorization(projectId, tabId) {
+    const key = syncKey(projectId, tabId);
+    const authorizedAt = authorizedProjectMutations.get(key);
+    if (authorizedAt && Date.now() - authorizedAt <= mutationAuthorizationWindowMs) return { allowed: true };
+    if (authorizedAt) authorizedProjectMutations.delete(key);
+    return {
+      allowed: false,
+      skipped: 'project-edit-not-verified',
+      message: 'Pin or update this project first so Websim can confirm that you are allowed to edit it.'
+    };
   }
 
   function visibilityKey(projectId, tabId) {
@@ -418,12 +494,16 @@
     const stored = await config();
     const projectId = await resolveProjectId(message);
     const tabId = normalizedTabId(message.tabId);
+    const isWebsimTab = isFirstPartyWebsimUrl(message.url);
+    const websimUser = isWebsimTab ? websimSessions.get(tabId) || null : null;
     return {
       ...stored,
       visibility: visibilityForContext(stored, projectId, tabId),
       visibilityScope: projectId ? 'project-tab' : 'default',
       activeTabId: tabId,
       activeProjectId: projectId,
+      isWebsimTab,
+      websimUser,
       lastEvents: eventsForProject(stored.lastEvents, projectId, tabId),
       debugLogs: logsForProject(stored.debugLogs, projectId, tabId, stored.projectMap),
       token: '',
@@ -509,6 +589,9 @@
   }
 
   async function autoSyncNewProject(payload, tabId) {
+    // A visit is never authorization. Only a successful PATCH from Websim can
+    // unlock a sync; see triggerAutoSync below.
+    return { ok: true, skipped: 'awaiting-project-mutation' };
     const settings = await config();
     if (!settings.enabled || !settings.token) return { ok: true, skipped: 'not-configured' };
     let projectId = null;
@@ -986,15 +1069,14 @@
         });
         return { ok: true, skipped: 'project-not-ready', message: 'Websim has not finalized this draft revision yet' };
       }
-      const ownership = ownershipForProject(readiness.project, projectId, tabId);
-      if (!ownership.allowed) {
+      const authorization = mutationAuthorization(projectId, tabId);
+      if (!authorization.allowed) {
         await debugLog('sync.blocked', {
           projectId,
           tabId: normalizedTabId(tabId),
-          reason: ownership.skipped,
-          creator: ownership.creator?.username || null
+          reason: authorization.skipped
         });
-        return { ok: false, skipped: ownership.skipped, message: ownership.message };
+        return { ok: false, skipped: authorization.skipped, message: authorization.message };
       }
       stage = 'fetch-current-revision';
       const { version, revision } = await currentRevision(projectId);
@@ -1091,6 +1173,8 @@
       title: null,
       requestedVersion: afterState.version
     };
+    authorizeProjectMutation(mutation.projectId, tabId);
+    await debugLog('project.edit.verified', { projectId: mutation.projectId, tabId, source: 'successful-project-patch' });
     await debugLog('pin.autosync.trigger', { tabId, ...payload });
     setSyncIndicator(true, tabId);
     if (tabId !== null) api.tabs.sendMessage(tabId, { type: 'SYNC_STARTED', source: 'project-patch' }).catch(() => {});
@@ -1122,11 +1206,6 @@
       const response = await wsJson(`/projects/${encodeURIComponent(projectId)}`);
       project = projectReadiness(response).project;
     } catch {}
-    const ownership = ownershipForProject(project, projectId, payload.tabId);
-    if (!ownership.allowed) {
-      await debugLog('repository.link.blocked', { projectId, tabId: normalizedTabId(payload.tabId), reason: ownership.skipped, creator: ownership.creator?.username || null });
-      return { ok: true, status: 'not-owned', projectId, message: ownership.message, creator: ownership.creator?.username || null };
-    }
     const generatedName = generatedRepoName(projectId, payload?.title || project.title, project.slug);
     const names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
     const repository = await findExistingRepository(user.login, settings.token, projectId, names);
@@ -1149,6 +1228,7 @@
     await debugLog('settings.visibility.requested', { projectId, tabId, visibility });
     let owner = stored.owner || '';
     let repository = null;
+    let ownershipBlocked = null;
 
     if (token) {
       const user = await githubRequest('/user', token);
@@ -1162,28 +1242,29 @@
         const response = await wsJson(`/projects/${encodeURIComponent(projectId)}`);
         project = projectReadiness(response).project;
       } catch {}
-      const ownership = ownershipForProject(project, projectId, tabId);
-      if (!ownership.allowed) {
-        await debugLog('settings.visibility.blocked', { projectId, tabId, reason: ownership.skipped, creator: ownership.creator?.username || null });
-        return { ok: false, projectId, message: ownership.message };
-      }
-      const mapped = stored.projectMap?.[projectId];
-      const generatedName = generatedRepoName(projectId, message.title || project.title, project.slug);
-      const names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
-      repository = await findExistingRepository(owner, token, projectId, names);
-      if (repository && Boolean(repository.private) !== (visibility === 'private')) {
-        await githubRequest(repoPath(owner, repository.name), token, {
-          method: 'PATCH',
-          body: JSON.stringify({ private: visibility === 'private' }),
-          headers: { 'Content-Type': 'application/json' }
-        });
-        await debugLog('repository.visibility.updated', {
-          projectId,
-          tabId,
-          owner,
-          repo: repository.name,
-          visibility
-        });
+      const authorization = mutationAuthorization(projectId, tabId);
+      if (!authorization.allowed) {
+        await debugLog('settings.visibility.blocked', { projectId, tabId, reason: authorization.skipped });
+        ownershipBlocked = authorization;
+      } else {
+        const mapped = stored.projectMap?.[projectId];
+        const generatedName = generatedRepoName(projectId, message.title || project.title, project.slug);
+        const names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
+        repository = await findExistingRepository(owner, token, projectId, names);
+        if (repository && Boolean(repository.private) !== (visibility === 'private')) {
+          await githubRequest(repoPath(owner, repository.name), token, {
+            method: 'PATCH',
+            body: JSON.stringify({ private: visibility === 'private' }),
+            headers: { 'Content-Type': 'application/json' }
+          });
+          await debugLog('repository.visibility.updated', {
+            projectId,
+            tabId,
+            owner,
+            repo: repository.name,
+            visibility
+          });
+        }
       }
     }
 
@@ -1196,7 +1277,7 @@
       // projects, while a default selection must persist globally.
       visibility: projectId ? normalizedVisibility(stored.visibility) : visibility
     };
-    if (projectId) {
+    if (projectId && !ownershipBlocked) {
       next.visibilityByContext = {
         ...(stored.visibilityByContext || {}),
         [visibilityKey(projectId, tabId)]: visibility
@@ -1214,7 +1295,9 @@
       owner,
       projectId,
       visibility,
-      message: `${projectId ? 'Saved for this project and tab.' : 'Saved as the default for new repositories.'}${repositoryMessage}`
+      message: ownershipBlocked
+        ? `GitHub connection saved. Project-specific settings were not changed: ${ownershipBlocked.message}`
+        : `${projectId ? 'Saved for this project and tab.' : 'Saved as the default for new repositories.'}${repositoryMessage}`
     };
   }
 
@@ -1244,17 +1327,7 @@
       api.webRequest.onCompleted?.addListener((details) => {
         const url = websimNetworkUrl(details.url);
         if (!url) return;
-        const read = details.method === 'GET' ? projectActivityRead(details.url) : null;
         const tabId = normalizedTabId(details.tabId);
-        // Check after Websim has finished its request. A check started from
-        // onBeforeRequest can only observe the previous, slug-less state.
-        if (read && tabId !== null) {
-          autoSyncNewProject({ projectId: read.projectId, url: details.documentUrl || details.url, title: null }, tabId).then((result) => {
-            if (!result?.skipped) notify(tabId, result);
-          }).catch((error) => {
-            debugLog('sync.page-ready.failed', { tabId, projectId: read.projectId, message: error.message });
-          });
-        }
         const tracked = trackedWebsimRequests.get(requestKey(details));
         if (tracked) {
           trackedWebsimRequests.delete(requestKey(details));
@@ -1295,22 +1368,23 @@
   }
 
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'REQUEST_WEBSIM_SESSION') {
+      const tabId = normalizedTabId(sender.tab?.id);
+      let isFirstParty = false;
+      try { isFirstParty = new URL(sender.url || '').hostname === 'websim.com'; } catch {}
+      if (sender.frameId !== 0 || !isFirstParty) {
+        sendResponse({ injected: false });
+        return;
+      }
+      requestWebsimSession(tabId).then(sendResponse).catch((error) => {
+        debugLog('websim.session.bridge.failed', { tabId, message: error.message });
+        sendResponse({ injected: false });
+      });
+      return true;
+    }
     if (message?.type === 'WEBSIM_SESSION') {
       const tabId = normalizedTabId(sender.tab?.id);
-      recordWebsimSession(message.payload, tabId).then(async (result) => {
-        // Session discovery commonly happens just after the first project API
-        // request. Re-check then; the ownership gate makes this safe.
-        if (result.user) {
-          const syncResult = await autoSyncNewProject({
-            projectId: message.payload?.projectId || null,
-            url: sender.tab?.url || message.payload.url || '',
-            title: null
-          }, tabId);
-          sendResponse({ ...result, sync: syncResult });
-          return;
-        }
-        sendResponse(result);
-      }).catch((error) => sendResponse({ ok: false, message: error.message }));
+      recordWebsimSession(message.payload, tabId).then(sendResponse).catch((error) => sendResponse({ ok: false, message: error.message }));
       return true;
     }
     if (message?.type === 'GET_STATE') {
@@ -1330,16 +1404,8 @@
       return true;
     }
     if (message?.type === 'PROJECT_PAGE_READY') {
-      const tabId = normalizedTabId(sender.tab?.id);
-      autoSyncNewProject(message.payload || message, tabId).then((result) => {
-        if (!result?.skipped) notify(tabId, result);
-        sendResponse(result);
-      }).catch((error) => {
-        const result = { ok: false, message: error.message };
-        notify(tabId, result);
-        sendResponse(result);
-      });
-      return true;
+      sendResponse({ ok: true, skipped: 'awaiting-project-mutation' });
+      return;
     }
     if (message?.type === 'SET_DEBUG_MODE') {
       storageSet({ advancedLogs: Boolean(message.enabled) }).then(() => sendResponse({ ok: true, advancedLogs: Boolean(message.enabled) }));
@@ -1360,10 +1426,8 @@
     }
     if (message?.type === 'PIN_DETECTED') {
       debugLog('pin.message.received', { tabId: sender.tab?.id || null, senderUrl: sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload: safeDebugDetail(message.payload || {}) });
-      setSyncIndicator(true, sender.tab?.id);
-      sync(message.payload, sender.tab?.id).then((result) => { notify(sender.tab?.id, result); sendResponse(result); })
-        .catch((error) => { const result = { ok: false, message: error.message }; notify(sender.tab?.id, result); sendResponse(result); });
-      return true;
+      sendResponse({ ok: true, skipped: 'awaiting-project-mutation', message: 'Waiting for Websim to confirm the project update…' });
+      return;
     }
     if (message?.type === 'SYNC_CURRENT') {
       const tabId = message.tabId;

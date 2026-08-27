@@ -1,12 +1,25 @@
 (() => {
+  function remixSessionUser(runtimeUser) {
+    const root = window.__remixContext?.state?.loaderData?.root;
+    const auth = root?.authUser;
+    const profile = root?.user;
+    const user = {
+      id: auth?.id ?? profile?.id ?? runtimeUser?.id,
+      email: auth?.email ?? runtimeUser?.email,
+      username: profile?.username ?? runtimeUser?.username,
+      avatar_url: profile?.avatar_url ?? runtimeUser?.avatar_url
+    };
+    return user.id || user.username ? user : null;
+  }
+
   const report = async () => {
     try {
       const websim = window.websim;
-      if (!websim?.getUser) return false;
-      const [user, project] = await Promise.all([
-        websim.getUser(),
-        websim.getCurrentProject?.().catch(() => null)
+      const [runtimeUser, project] = await Promise.all([
+        websim?.getUser ? websim.getUser() : null,
+        websim?.getCurrentProject ? websim.getCurrentProject().catch(() => null) : null
       ]);
+      const user = remixSessionUser(runtimeUser);
       window.postMessage({
         source: 'pin-to-github',
         type: 'WEBSIM_SESSION',
@@ -14,7 +27,7 @@
         projectId: project?.id || null,
         url: location.href
       }, location.origin);
-      return true;
+      return Boolean(user);
     } catch {
       return false;
     }

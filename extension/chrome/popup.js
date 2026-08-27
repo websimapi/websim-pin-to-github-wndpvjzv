@@ -15,6 +15,16 @@ async function stateForActiveTab() {
   return send({ type: 'GET_STATE', tabId: tab?.id, url: tab?.url, title: tab?.title });
 }
 
+function renderWebsimAccount(state) {
+  const node = $('websim-account');
+  if (!state?.isWebsimTab) {
+    node.textContent = 'Open Websim';
+    return;
+  }
+  const username = String(state.websimUser?.username || '').trim();
+  node.textContent = username ? `@${username}` : 'Detecting…';
+}
+
 function render(state) {
   currentState = state;
   $('enabled').checked = state.enabled !== false;
@@ -24,6 +34,7 @@ function render(state) {
   $('customBranch').value = state.customBranch || '';
   $('advanced-logs').checked = state.advancedLogs === true;
   $('custom-branch-wrap').classList.toggle('hidden', state.branchMode !== 'custom');
+  renderWebsimAccount(state);
   $('github-account').textContent = state.owner ? `@${state.owner}` : 'Not connected yet';
   $('state-pill').textContent = state.enabled !== false && state.hasToken ? 'READY' : 'SETUP';
   $('state-pill').className = `state-pill ${state.enabled === false ? 'paused' : 'ready'}`;
@@ -152,4 +163,17 @@ $('sync-current').addEventListener('click', async () => {
   refreshProjectLink();
 });
 
-stateForActiveTab().then((state) => { render(state); refreshProjectLink(); });
+async function loadInitialState() {
+  let state = await stateForActiveTab();
+  render(state);
+  refreshProjectLink();
+  if (!state?.isWebsimTab || state.websimUser?.username) return;
+  for (let attempt = 0; attempt < 18; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    state = await stateForActiveTab();
+    renderWebsimAccount(state);
+    if (!state?.isWebsimTab || state.websimUser?.username) break;
+  }
+}
+
+loadInitialState();
