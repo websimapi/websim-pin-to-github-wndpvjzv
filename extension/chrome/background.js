@@ -125,6 +125,32 @@
     return { injected: true };
   }
 
+  async function readWebsimSession(tabId) {
+    const scope = normalizedTabId(tabId);
+    if (scope === null || !api.scripting?.executeScript) return null;
+    const results = await api.scripting.executeScript({
+      target: { tabId: scope },
+      world: 'MAIN',
+      func: async () => {
+        let runtimeUser = null;
+        try {
+          if (window.websim?.getUser) runtimeUser = await window.websim.getUser();
+        } catch {}
+        const root = window.__remixContext?.state?.loaderData?.root;
+        const auth = root?.authUser;
+        const profile = root?.user;
+        const user = {
+          id: auth?.id ?? profile?.id ?? runtimeUser?.id,
+          email: auth?.email ?? runtimeUser?.email,
+          username: profile?.username ?? runtimeUser?.username,
+          avatar_url: profile?.avatar_url ?? runtimeUser?.avatar_url
+        };
+        return user.id || user.username ? { id: user.id, username: user.username } : null;
+      }
+    });
+    return normalizedWebsimUser(results?.[0]?.result);
+  }
+
   function syncKey(projectId, tabId) {
     const scope = normalizedTabId(tabId);
     return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`;
@@ -1368,6 +1394,27 @@
   }
 
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'GET_WEBSIM_SESSION') {
+      const tabId = normalizedTabId(message.tabId);
+      if (sender.tab || !isFirstPartyWebsimUrl(message.url)) {
+        sendResponse({ ok: true, user: null });
+        return;
+      }
+      readWebsimSession(tabId).then((user) => {
+        if (user) websimSessions.set(tabId, user);
+        else websimSessions.delete(tabId);
+        debugLog('websim.session.popup.read', {
+          tabId,
+          username: user?.username || null,
+          signedIn: Boolean(user)
+        });
+        sendResponse({ ok: true, user });
+      }).catch((error) => {
+        debugLog('websim.session.popup.read.failed', { tabId, message: error.message });
+        sendResponse({ ok: false, user: null, message: error.message });
+      });
+      return true;
+    }
     if (message?.type === 'REQUEST_WEBSIM_SESSION') {
       const tabId = normalizedTabId(sender.tab?.id);
       let isFirstParty = false;

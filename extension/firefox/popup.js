@@ -4,6 +4,7 @@ let currentState = null;
 function send(message) { return new Promise((resolve) => api.runtime.sendMessage(message, resolve)); }
 function activeTab() { return new Promise((resolve) => api.tabs.query({ active:true, currentWindow:true }, (tabs) => resolve(tabs?.[0] || null))); }
 async function stateForActiveTab() { const tab=await activeTab(); return send({ type:'GET_STATE', tabId:tab?.id, url:tab?.url, title:tab?.title }); }
+async function refreshWebsimSession() { const tab=await activeTab(); return send({ type:'GET_WEBSIM_SESSION', tabId:tab?.id, url:tab?.url, title:tab?.title }); }
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function renderWebsimAccount(state) { const node=$('websim-account'); if (!state?.isWebsimTab) { node.textContent='Open Websim'; return; } const username=String(state.websimUser?.username || '').trim(); node.textContent=username ? `@${username}` : 'Detecting…'; }
 function render(state) {
@@ -75,12 +76,14 @@ $('sync-current').addEventListener('click', async () => {
   message(result?.message || 'Done.', !result?.ok); render(await stateForActiveTab()); refreshProjectLink();
 });
 async function loadInitialState() {
+  await refreshWebsimSession();
   let state=await stateForActiveTab();
   render(state);
   refreshProjectLink();
   if (!state?.isWebsimTab || state.websimUser?.username) return;
   for (let attempt=0; attempt<18; attempt+=1) {
     await new Promise((resolve) => setTimeout(resolve, 350));
+    await refreshWebsimSession();
     state=await stateForActiveTab();
     renderWebsimAccount(state);
     if (!state?.isWebsimTab || state.websimUser?.username) break;

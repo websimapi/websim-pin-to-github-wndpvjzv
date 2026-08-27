@@ -15,6 +15,11 @@ async function stateForActiveTab() {
   return send({ type: 'GET_STATE', tabId: tab?.id, url: tab?.url, title: tab?.title });
 }
 
+async function refreshWebsimSession() {
+  const tab = await activeTab();
+  return send({ type: 'GET_WEBSIM_SESSION', tabId: tab?.id, url: tab?.url, title: tab?.title });
+}
+
 function renderWebsimAccount(state) {
   const node = $('websim-account');
   if (!state?.isWebsimTab) {
@@ -164,12 +169,14 @@ $('sync-current').addEventListener('click', async () => {
 });
 
 async function loadInitialState() {
+  await refreshWebsimSession();
   let state = await stateForActiveTab();
   render(state);
   refreshProjectLink();
   if (!state?.isWebsimTab || state.websimUser?.username) return;
   for (let attempt = 0; attempt < 18; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 350));
+    await refreshWebsimSession();
     state = await stateForActiveTab();
     renderWebsimAccount(state);
     if (!state?.isWebsimTab || state.websimUser?.username) break;
