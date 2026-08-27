@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pin to GitHub",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "Commit the current Websim revision to GitHub when you pin a project.",
   "permissions": ["storage", "notifications", "tabs", "clipboardWrite", "webRequest"],
   "host_permissions": [
@@ -23,6 +23,10 @@
       "run_at": "document_idle"
     }
   ],
+  "web_accessible_resources": [{
+    "resources": ["page-bridge.js"],
+    "matches": ["https://websim.com/*"]
+  }],
   "icons": {
     "16": "icon-16.png",
     "48": "icon-48.png",

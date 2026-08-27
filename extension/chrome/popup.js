@@ -59,6 +59,11 @@ async function refreshProjectLink() {
       metaNode.textContent = 'Open a Websim project in the active tab';
       return;
     }
+    if (result?.status === 'not-owned') {
+      repoNode.textContent = 'Not your project';
+      metaNode.textContent = result.message || 'Only projects created by your signed-in Websim account can be synced';
+      return;
+    }
     if (!result?.ok) throw new Error(result?.message || 'Could not inspect the project link');
     repoNode.textContent = `${result.owner}/${result.repo}`;
     metaNode.textContent = `${result.status === 'linked' ? 'Linked repository' : 'Planned repository'} · ${result.branch} branch · ${result.visibility}`;

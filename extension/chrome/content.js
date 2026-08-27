@@ -48,6 +48,21 @@
     api.runtime.sendMessage({ type: 'DEBUG_EVENT', event, detail }).catch(() => {});
   }
 
+  function installWebsimSessionBridge() {
+    // Only the first-party Websim app is trusted to identify the signed-in
+    // account. Project iframes can run arbitrary creator code.
+    if (window.top !== window.self || location.hostname !== 'websim.com') return;
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (event.source !== window || event.origin !== location.origin || data?.source !== 'pin-to-github' || data?.type !== 'WEBSIM_SESSION') return;
+      api.runtime.sendMessage({ type: 'WEBSIM_SESSION', payload: data }).catch((error) => debug('content.session.error', { message: error.message }));
+    });
+    const script = document.createElement('script');
+    script.src = api.runtime.getURL('page-bridge.js');
+    script.onload = script.onerror = () => script.remove();
+    (document.head || document.documentElement).appendChild(script);
+  }
+
   function interactiveTarget(event) {
     const path = event.composedPath?.() || [];
     return path.find((node) => node?.matches?.('button, a, [role="button"], [data-project-id]')) ||
@@ -149,6 +164,7 @@
       showToast(message.ok ? `✓ ${message.message}` : `Pin to GitHub: ${message.message}`, message.ok ? 'success' : 'error');
     }
   });
+  installWebsimSessionBridge();
   debug('content.ready', {
     page: location.href.split(/[?#]/)[0],
     isFrame: window.top !== window.self,

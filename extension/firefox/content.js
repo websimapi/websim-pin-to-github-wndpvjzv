@@ -21,6 +21,12 @@
   }
   function pageReadyContext() { const frame=document.querySelector('iframe[src*=".c.websim.com"]'), directProjectId=projectIdFromUrl(location.href) || projectIdFromUrl(frame?.src), isProjectRoute=/^\/@[^/]+\/[^/]+/.test(location.pathname); if (!directProjectId && !isProjectRoute) return null; return { projectId:directProjectId || null, url:location.href, title:document.title.replace(/\s*[|·—-]\s*Websim.*$/i,'').trim() }; }
   function debug(event, detail = {}) { api.runtime.sendMessage({ type:'DEBUG_EVENT', event, detail }).catch(() => {}); }
+  function installWebsimSessionBridge() {
+    // Do not trust project iframe code with session identity.
+    if (window.top !== window.self || location.hostname !== 'websim.com') return;
+    window.addEventListener('message', (event) => { const data=event.data; if (event.source !== window || event.origin !== location.origin || data?.source !== 'pin-to-github' || data?.type !== 'WEBSIM_SESSION') return; api.runtime.sendMessage({ type:'WEBSIM_SESSION', payload:data }).catch((error) => debug('content.session.error', { message:error.message })); });
+    const script=document.createElement('script'); script.src=api.runtime.getURL('page-bridge.js'); script.onload=script.onerror=() => script.remove(); (document.head || document.documentElement).appendChild(script);
+  }
   function interactiveTarget(event) { const path=event.composedPath?.() || []; return path.find((node) => node?.matches?.('button,a,[role="button"],[data-project-id]')) || path.find((node) => node?.getAttribute && /\b(pin|pinned|bookmark|collection)\b/i.test(`${node.getAttribute('aria-label') || ''} ${node.getAttribute('title') || ''}`)) || event.target.closest?.('button,a,[role="button"],[data-project-id]'); }
   function targetSummary(element) { return { tag:element?.tagName || null, id:element?.id || null, className:String(element?.className || '').slice(0,180), ariaLabel:element?.getAttribute?.('aria-label') || null, title:element?.getAttribute?.('title') || null, text:element?.textContent?.replace(/\s+/g,' ').trim().slice(0,180) || null, href:element?.href ? String(element.href).split(/[?#]/)[0] : null, dataAttributes:element?.dataset ? Object.fromEntries(Object.entries(element.dataset).slice(0,12)) : {} }; }
   function looksLikePin(element) {
@@ -52,6 +58,7 @@
     if (message?.type === 'SYNC_STARTED') showToast('Syncing revision to GitHub…', 'loading');
     if (message?.type === 'SYNC_RESULT') { debug('content.sync.result', { ok:Boolean(message.ok), message:message.message || null }); showToast(message.ok ? `✓ ${message.message}` : `Pin to GitHub: ${message.message}`, message.ok ? 'success' : 'error'); }
   });
+  installWebsimSessionBridge();
   debug('content.ready', { page:location.href.split(/[?#]/)[0], isFrame:window.top !== window.self, pinCandidates:[...document.querySelectorAll('button,a,[role="button"]')].filter(looksLikePin).slice(0,12).map(targetSummary) });
   const pageReadyRetryDelays=[500,1000,2000,3000,5000,8000,12000,20000];
   function requestPageReady(payload, attempt=0) {
