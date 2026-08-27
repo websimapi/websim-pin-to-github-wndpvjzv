@@ -230,9 +230,8 @@
     debugLog('sync.page-ready.retry.scheduled', { projectId, tabId:normalizedTabId(tabId), attempt:retry.attempt, delayMs:delay, reason:'project-not-ready' });
   }
   async function autoSyncNewProject(payload, tabId) {
-    // A successful Websim project PATCH is the only sync authorization.
-    return { ok:true, skipped:'awaiting-project-mutation' };
     const settings=await config(); if (!settings.enabled || !settings.token) return { ok:true, skipped:'not-configured' };
+    try { const session=await readWebsimSession(tabId); if (session) websimSessions.set(normalizedTabId(tabId), session); } catch {}
     let projectId=null;
     for (let attempt=0; attempt<3 && !projectId; attempt+=1) {
       projectId=await resolveProjectId(payload);
@@ -262,6 +261,8 @@
       const linked=settings.projectMap?.[projectId];
       if (linked && String(knownSyncedVersion(settings, projectId)) === String(version)) { await debugLog('sync.page-ready.skipped', { projectId, tabId:normalizedTabId(tabId), reason:'version-already-synced', version }); cancelReadinessRetry(projectId, tabId); return { ok:true, skipped:'version-already-synced', projectId }; }
       const readyPayload={ ...payload, projectId, title:payload.title || project.title || null, slug:project.slug || null };
+      authorizeProjectMutation(projectId, tabId);
+      await debugLog('project.edit.verified', { projectId, tabId:normalizedTabId(tabId), source:'active-project-owner' });
       rememberProjectLogScope(projectId, tabId); setSyncIndicator(true, tabId);
       if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type:'SYNC_STARTED', source:'project-page-ready' }).catch(() => {});
       return await sync(readyPayload, tabId);
@@ -414,6 +415,14 @@
     if (tabId !== null) api.tabs.sendMessage(tabId, { type:'SYNC_STARTED', source:'project-patch' }).catch(() => {});
     sync(payload,tabId).then((result) => notify(tabId,result)).catch((error) => notify(tabId,{ ok:false, message:error.message }));
   }
+  async function triggerActivityAutoSync(details, activity) {
+    const tabId=normalizedTabId(details.tabId);
+    if (tabId === null || details.statusCode < 200 || details.statusCode >= 300) return;
+    let tab=null; try { tab=await api.tabs.get(tabId); } catch {}
+    const payload={ projectId:activity.projectId, url:tab?.url || details.documentUrl || `https://websim.com/p/${activity.projectId}`, title:null, ...(activity.version ? { requestedVersion:activity.version } : {}) };
+    await debugLog('pin.activity.detected', { tabId, ...payload, source:activity.version ? 'revision-assets' : 'project-read' });
+    autoSyncNewProject(payload,tabId).then((result) => { if (!result?.skipped) notify(tabId,result); }).catch((error) => debugLog('pin.activity.failed', { tabId, projectId:activity.projectId, message:error.message }));
+  }
   function notify(tabId, result) { setSyncIndicator(activeSyncForTab(tabId), tabId); if (result?.inProgress || result?.skipped === 'in-progress') return; if (Number.isInteger(tabId) && tabId >= 0) api.tabs.sendMessage(tabId, { type:'SYNC_RESULT', ...result }).catch(() => {}); if (result.ok && api.notifications) api.notifications.create(`pin-${Date.now()}`, { type:'basic', title:'Pin to GitHub', message:result.message, iconUrl:api.runtime.getURL('icon-128.png') }).catch(() => {}); }
   if (api.webRequest?.onBeforeRequest) {
     const requestFilter = { urls:['https://websim.com/*','https://*.websim.com/*'] };
@@ -425,7 +434,7 @@
         if (mutation) { const beforeState=readProjectMutationState(mutation.projectId); trackedWebsimRequests.set(requestKey(details), { mutation, body, beforeState, tabId:details.tabId }); debugLog('pin.candidate.request', { tabId:details.tabId, projectId:mutation.projectId, method:details.method, body }); }
         config().then((state) => state.advancedLogs && debugLog('network.request', { requestId:details.requestId, tabId, method:details.method, type:details.type, url, ...(mutation ? { projectId:mutation.projectId, body } : {}) }));
       }, requestFilter, ['requestBody']);
-      api.webRequest.onCompleted?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tabId=normalizedTabId(details.tabId), tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); Promise.resolve(tracked.beforeState).then((beforeState) => triggerAutoSync(details, tracked.mutation, tracked.body, beforeState)).catch((error) => debugLog('pin.autosync.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, message:error.message })); } config().then((state) => state.advancedLogs && debugLog('network.response', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), status:details.statusCode, type:details.type, url })); }, requestFilter);
+      api.webRequest.onCompleted?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tabId=normalizedTabId(details.tabId), tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); Promise.resolve(tracked.beforeState).then((beforeState) => triggerAutoSync(details, tracked.mutation, tracked.body, beforeState)).catch((error) => debugLog('pin.autosync.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, message:error.message })); } const activity=details.method === 'GET' ? projectActivityRead(details.url) : null; if (activity) triggerActivityAutoSync(details,activity); config().then((state) => state.advancedLogs && debugLog('network.response', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), status:details.statusCode, type:details.type, url })); }, requestFilter);
       api.webRequest.onErrorOccurred?.addListener((details) => { const url=websimNetworkUrl(details.url); if (!url) return; const tracked=trackedWebsimRequests.get(requestKey(details)); if (tracked) { trackedWebsimRequests.delete(requestKey(details)); debugLog('pin.candidate.failed', { tabId:details.tabId, projectId:tracked.mutation.projectId, error:details.error, body:tracked.body }); } config().then((state) => state.advancedLogs && debugLog('network.error', { requestId:details.requestId, tabId:normalizedTabId(details.tabId), error:details.error, type:details.type, url })); }, requestFilter);
       debugLog('network.monitor.ready', { watches:['PATCH /api/v1/projects/{id}', 'Websim API requests'] });
     } catch (error) { debugLog('network.monitor.unavailable', { message:error.message }); }
@@ -480,11 +489,34 @@
     if (message?.type === 'GET_LOGS') { stateForContext(message).then((state) => sendResponse({ logs:state.debugLogs || [], activeProjectId:state.activeProjectId, activeTabId:state.activeTabId })); return true; }
     if (message?.type === 'GET_PROJECT_LINK') { projectLink(message).then(sendResponse).catch((error) => sendResponse({ ok:false, message:error.message })); return true; }
     if (message?.type === 'CLEAR_LOGS') { clearLogsForContext(message).then(() => sendResponse({ok:true})); return true; }
-    if (message?.type === 'PROJECT_PAGE_READY') { sendResponse({ ok:true, skipped:'awaiting-project-mutation' }); return; }
+    if (message?.type === 'PROJECT_PAGE_READY') {
+      const tabId=normalizedTabId(sender.tab?.id);
+      autoSyncNewProject(message.payload, tabId).then((result) => {
+        if (!result?.skipped) notify(tabId,result);
+        sendResponse(result);
+      }).catch((error) => {
+        const result={ ok:false, message:error.message };
+        notify(tabId,result);
+        sendResponse(result);
+      });
+      return true;
+    }
     if (message?.type === 'SET_DEBUG_MODE') { storageSet({ advancedLogs:Boolean(message.enabled) }).then(() => sendResponse({ ok:true, advancedLogs:Boolean(message.enabled) })); return true; }
     if (message?.type === 'DEBUG_EVENT') { config().then((stored) => { if (!stored.advancedLogs) return sendResponse({ ok:true, recorded:false }); const detail=safeDebugDetail(message.detail); if (sender.tab?.id !== undefined) detail.tabId=normalizedTabId(sender.tab.id); debugLog(message.event || 'content.debug', detail).then(() => sendResponse({ ok:true, recorded:true })); }); return true; }
     if (message?.type === 'SAVE_SETTINGS') { saveSettings(message).then(sendResponse).catch((error) => sendResponse({ ok:false, message:error.message })); return true; }
-    if (message?.type === 'PIN_DETECTED') { debugLog('pin.message.received', { tabId:sender.tab?.id || null, senderUrl:sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload:safeDebugDetail(message.payload || {}) }); sendResponse({ ok:true, skipped:'awaiting-project-mutation', message:'Waiting for Websim to confirm the project update…' }); return; }
+    if (message?.type === 'PIN_DETECTED') {
+      const tabId=normalizedTabId(sender.tab?.id);
+      debugLog('pin.message.received', { tabId, senderUrl:sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload:safeDebugDetail(message.payload || {}) });
+      autoSyncNewProject(message.payload, tabId).then((result) => {
+        if (!result?.skipped) notify(tabId,result);
+        sendResponse(result);
+      }).catch((error) => {
+        const result={ ok:false, message:error.message };
+        notify(tabId,result);
+        sendResponse(result);
+      });
+      return true;
+    }
     if (message?.type === 'SYNC_CURRENT') { const url=message.url || '', id=url.match(/\/(?:c|p)\/([a-zA-Z0-9_-]+)/)?.[1] || url.match(/^https:\/\/([a-zA-Z0-9_-]+)\.c\.websim\.com/)?.[1]; setSyncIndicator(true, message.tabId); sync({ projectId:id, url, title:message.title }, message.tabId).then((result) => { notify(message.tabId,result); sendResponse(result); }).catch((error) => { const result={ok:false,message:error.message}; notify(message.tabId,result); sendResponse(result); }); return true; }
   });
   api.tabs?.onRemoved?.addListener((tabId) => websimSessions.delete(tabId));

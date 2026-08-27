@@ -615,11 +615,12 @@
   }
 
   async function autoSyncNewProject(payload, tabId) {
-    // A visit is never authorization. Only a successful PATCH from Websim can
-    // unlock a sync; see triggerAutoSync below.
-    return { ok: true, skipped: 'awaiting-project-mutation' };
     const settings = await config();
     if (!settings.enabled || !settings.token) return { ok: true, skipped: 'not-configured' };
+    try {
+      const session = await readWebsimSession(tabId);
+      if (session) websimSessions.set(normalizedTabId(tabId), session);
+    } catch {}
     let projectId = null;
     for (let attempt = 0; attempt < 3 && !projectId; attempt += 1) {
       projectId = await resolveProjectId(payload);
@@ -689,6 +690,12 @@
         title: payload.title || project.title || null,
         slug: project.slug || null
       };
+      authorizeProjectMutation(projectId, tabId);
+      await debugLog('project.edit.verified', {
+        projectId,
+        tabId: normalizedTabId(tabId),
+        source: 'active-project-owner'
+      });
       rememberProjectLogScope(projectId, tabId);
       setSyncIndicator(true, tabId);
       if (normalizedTabId(tabId) !== null) api.tabs.sendMessage(normalizedTabId(tabId), { type: 'SYNC_STARTED', source: 'project-page-ready' }).catch(() => {});
@@ -1210,6 +1217,25 @@
     });
   }
 
+  async function triggerActivityAutoSync(details, activity) {
+    const tabId = normalizedTabId(details.tabId);
+    if (tabId === null || details.statusCode < 200 || details.statusCode >= 300) return;
+    let tab = null;
+    try { tab = await api.tabs.get(tabId); } catch {}
+    const payload = {
+      projectId: activity.projectId,
+      url: tab?.url || details.documentUrl || `https://websim.com/p/${activity.projectId}`,
+      title: null,
+      ...(activity.version ? { requestedVersion: activity.version } : {})
+    };
+    await debugLog('pin.activity.detected', { tabId, ...payload, source: activity.version ? 'revision-assets' : 'project-read' });
+    autoSyncNewProject(payload, tabId).then((result) => {
+      if (!result?.skipped) notify(tabId, result);
+    }).catch((error) => {
+      debugLog('pin.activity.failed', { tabId, projectId: activity.projectId, message: error.message });
+    });
+  }
+
   async function notify(tabId, result) {
     setSyncIndicator(activeSyncForTab(tabId), tabId);
     if (result?.inProgress || result?.skipped === 'in-progress') return;
@@ -1363,6 +1389,8 @@
             debugLog('pin.autosync.failed', { tabId: details.tabId, projectId: tracked.mutation.projectId, message: error.message });
           });
         }
+        const activity = details.method === 'GET' ? projectActivityRead(details.url) : null;
+        if (activity) triggerActivityAutoSync(details, activity);
         config().then((state) => state.advancedLogs && debugLog('network.response', {
           requestId: details.requestId,
           tabId: normalizedTabId(details.tabId),
@@ -1451,8 +1479,16 @@
       return true;
     }
     if (message?.type === 'PROJECT_PAGE_READY') {
-      sendResponse({ ok: true, skipped: 'awaiting-project-mutation' });
-      return;
+      const tabId = normalizedTabId(sender.tab?.id);
+      autoSyncNewProject(message.payload, tabId).then((result) => {
+        if (!result?.skipped) notify(tabId, result);
+        sendResponse(result);
+      }).catch((error) => {
+        const result = { ok: false, message: error.message };
+        notify(tabId, result);
+        sendResponse(result);
+      });
+      return true;
     }
     if (message?.type === 'SET_DEBUG_MODE') {
       storageSet({ advancedLogs: Boolean(message.enabled) }).then(() => sendResponse({ ok: true, advancedLogs: Boolean(message.enabled) }));
@@ -1472,9 +1508,17 @@
       return true;
     }
     if (message?.type === 'PIN_DETECTED') {
-      debugLog('pin.message.received', { tabId: sender.tab?.id || null, senderUrl: sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload: safeDebugDetail(message.payload || {}) });
-      sendResponse({ ok: true, skipped: 'awaiting-project-mutation', message: 'Waiting for Websim to confirm the project update…' });
-      return;
+      const tabId = normalizedTabId(sender.tab?.id);
+      debugLog('pin.message.received', { tabId, senderUrl: sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload: safeDebugDetail(message.payload || {}) });
+      autoSyncNewProject(message.payload, tabId).then((result) => {
+        if (!result?.skipped) notify(tabId, result);
+        sendResponse(result);
+      }).catch((error) => {
+        const result = { ok: false, message: error.message };
+        notify(tabId, result);
+        sendResponse(result);
+      });
+      return true;
     }
     if (message?.type === 'SYNC_CURRENT') {
       const tabId = message.tabId;
