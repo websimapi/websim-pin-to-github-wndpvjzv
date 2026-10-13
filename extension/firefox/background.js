@@ -37,9 +37,9 @@
   function syncKey(projectId, tabId) { const scope = normalizedTabId(tabId); return `${scope === null ? 'background' : `tab:${scope}`}:${projectId}`; }
   function authorizeProjectMutation(projectId, tabId) { authorizedProjectMutations.set(syncKey(projectId, tabId), Date.now()); }
   function mutationAuthorization(projectId, tabId) { const key=syncKey(projectId,tabId), authorizedAt=authorizedProjectMutations.get(key); if (authorizedAt && Date.now() - authorizedAt <= mutationAuthorizationWindowMs) return { allowed:true }; if (authorizedAt) authorizedProjectMutations.delete(key); return { allowed:false, skipped:'project-edit-not-verified', message:'Pin or update this project first so Websim can confirm that you are allowed to edit it.' }; }
-  function visibilityKey(projectId, tabId) { return syncKey(projectId, tabId); }
+  function visibilityKey(projectId, tabId) { return String(projectId || ''); }
   function normalizedVisibility(value) { return value === 'public' ? 'public' : 'private'; }
-  function visibilityForContext(settings, projectId, tabId) { const scoped = projectId ? settings.visibilityByContext?.[visibilityKey(projectId, tabId)] : null; return normalizedVisibility(scoped ?? settings.visibility); }
+  function visibilityForContext(settings, projectId, tabId) { const overrides=settings.visibilityByContext || {}; const scoped=projectId ? overrides[visibilityKey(projectId, tabId)] ?? overrides[syncKey(projectId, tabId)] ?? Object.entries(overrides).find(([key]) => key.endsWith(`:${projectId}`))?.[1] : null; return normalizedVisibility(scoped ?? settings.visibility); }
   function activeSyncForTab(tabId) { const scope = normalizedTabId(tabId), prefix = `${scope === null ? 'background' : `tab:${scope}`}:`; return [...activeSyncs].some((key) => key.startsWith(prefix)); }
   function requestKey(details) { return `${normalizedTabId(details.tabId) ?? 'background'}:${details.requestId}`; }
   function rememberProjectLogScope(projectId, tabId) { if (projectId) projectLogScopes.set(String(projectId), normalizedTabId(tabId)); }
@@ -191,7 +191,7 @@
   function eventsForProject(events, projectId, tabId) { if (!projectId) return []; return (events || []).filter((entry) => belongsToContext(entry, projectId, tabId, {})); }
   async function stateForContext(message = {}) {
     const stored=await config(), projectId=await resolveProjectId(message), tabId=normalizedTabId(message.tabId), isWebsimTab=isFirstPartyWebsimUrl(message.url), websimUser=isWebsimTab ? websimSessions.get(tabId) || null : null;
-    return { ...stored, visibility:visibilityForContext(stored, projectId, tabId), visibilityScope:projectId ? 'project-tab' : 'default', activeTabId:tabId, activeProjectId:projectId, isWebsimTab, websimUser, lastEvents:eventsForProject(stored.lastEvents, projectId, tabId), debugLogs:logsForProject(stored.debugLogs, projectId, tabId, stored.projectMap), token:'', hasToken:Boolean(stored.token) };
+    return { ...stored, visibility:visibilityForContext(stored, projectId, tabId), globalVisibility:normalizedVisibility(stored.visibility), visibilityScope:projectId ? 'project' : 'default', activeTabId:tabId, activeProjectId:projectId, isWebsimTab, websimUser, lastEvents:eventsForProject(stored.lastEvents, projectId, tabId), debugLogs:logsForProject(stored.debugLogs, projectId, tabId, stored.projectMap), token:'', hasToken:Boolean(stored.token) };
   }
   async function clearLogsForContext(message = {}) {
     const stored=await config(), projectId=await resolveProjectId(message); if (!projectId) return;
@@ -454,19 +454,25 @@
       else {
         const mapped = stored.projectMap?.[projectId], generatedName = generatedRepoName(projectId, message.title || project.title, project.slug), names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
         repository = await findExistingRepository(owner, token, projectId, names);
-        if (repository && Boolean(repository.private) !== (visibility === 'private')) {
+        if (repository && Object.prototype.hasOwnProperty.call(incoming, 'visibility') && Boolean(repository.private) !== (visibility === 'private')) {
           await gh(repoPath(owner, repository.name), token, { method:'PATCH', body:JSON.stringify({ private:visibility === 'private' }), headers:{'Content-Type':'application/json'} });
           await debugLog('repository.visibility.updated', { projectId, tabId, owner, repo:repository.name, visibility });
         }
       }
     }
-    // Keep project/tab overrides separate from the default for new projects.
+    // Keep project overrides separate from the default for new projects.
     const next = { ...stored, ...incoming, token, owner, visibility:projectId ? normalizedVisibility(stored.visibility) : visibility };
-    if (projectId && !ownershipBlocked) next.visibilityByContext = { ...(stored.visibilityByContext || {}), [visibilityKey(projectId, tabId)]:visibility };
-    else next.visibility = visibility;
+    if (projectId && !ownershipBlocked && Object.prototype.hasOwnProperty.call(incoming, 'visibility')) next.visibilityByContext = { ...(stored.visibilityByContext || {}), [visibilityKey(projectId, tabId)]:visibility };
+    else if (!projectId) next.visibility = visibility;
     await storageSet(next);
-    const repositoryMessage = repository ? ` Updated ${owner}/${repository.name} to ${visibility}.` : '';
-    return { ok:true, owner, projectId, visibility, message:ownershipBlocked ? `GitHub connection saved. Project-specific settings were not changed: ${ownershipBlocked.message}` : `${projectId ? 'Saved for this project and tab.' : 'Saved as the default for new repositories.'}${repositoryMessage}` };
+    const repositoryMessage = repository && Object.prototype.hasOwnProperty.call(incoming, 'visibility') ? ` Updated ${owner}/${repository.name} to ${visibility}.` : '';
+    return { ok:true, owner, projectId, visibility, message:ownershipBlocked ? `GitHub connection saved. Project-specific settings were not changed: ${ownershipBlocked.message}` : `${projectId ? (Object.prototype.hasOwnProperty.call(incoming, 'visibility') ? 'Saved for this project.' : 'Connection saved.') : 'Saved as the default for new repositories.'}${repositoryMessage}` };
+  }
+  async function setGlobalVisibility(message) {
+    const visibility=normalizedVisibility(message.visibility);
+    await storageSet({ visibility });
+    await debugLog('settings.visibility.global.updated', { visibility, overridesPreserved:true });
+    return { ok:true, visibility };
   }
   async function projectLink(payload) { const settings=await config(); if (!settings.token) return { ok:true, status:'not-configured' }; const projectId=await resolveProjectId(payload); if (!projectId) return { ok:true, status:'not-websim' }; let project={}; try { const response=await wsJson(`/projects/${encodeURIComponent(projectId)}`); project=projectReadiness(response).project; } catch {} rememberProjectLogScope(projectId, payload.tabId); const mapped=settings.projectMap?.[projectId], user=await gh('/user', settings.token), generatedName=generatedRepoName(projectId, payload?.title || project.title, project.slug), names=[...new Set([mapped?.repo, generatedName].filter(Boolean))], repository=await findExistingRepository(user.login, settings.token, projectId, names), repo=repository?.name || generatedName; rememberRepoLogScope(user.login, repo, projectId, payload.tabId); const mappedRepository=mapped?.repo && repo.toLowerCase() === String(mapped.repo).toLowerCase(), branch=mappedRepository && mapped.branch ? mapped.branch : branchName(settings, repository || {}), visibility=repository ? (repository.private ? 'private' : 'public') : visibilityForContext(settings, projectId, payload.tabId); await debugLog('repository.link.preview', { projectId, owner:user.login, repo, branch, visibility, status:repository ? 'linked' : 'planned' }); return { ok:true, status:repository ? 'linked' : 'planned', projectId, owner:user.login, repo, branch, visibility, url:`https://github.com/${user.login}/${repo}` }; }
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -504,6 +510,7 @@
     if (message?.type === 'SET_DEBUG_MODE') { storageSet({ advancedLogs:Boolean(message.enabled) }).then(() => sendResponse({ ok:true, advancedLogs:Boolean(message.enabled) })); return true; }
     if (message?.type === 'DEBUG_EVENT') { config().then((stored) => { if (!stored.advancedLogs) return sendResponse({ ok:true, recorded:false }); const detail=safeDebugDetail(message.detail); if (sender.tab?.id !== undefined) detail.tabId=normalizedTabId(sender.tab.id); debugLog(message.event || 'content.debug', detail).then(() => sendResponse({ ok:true, recorded:true })); }); return true; }
     if (message?.type === 'SAVE_SETTINGS') { saveSettings(message).then(sendResponse).catch((error) => sendResponse({ ok:false, message:error.message })); return true; }
+    if (message?.type === 'SET_GLOBAL_VISIBILITY') { setGlobalVisibility(message).then(sendResponse).catch((error) => sendResponse({ ok:false, message:error.message })); return true; }
     if (message?.type === 'PIN_DETECTED') {
       const tabId=normalizedTabId(sender.tab?.id);
       debugLog('pin.message.received', { tabId, senderUrl:sender.url ? String(sender.url).split(/[?#]/)[0] : null, payload:safeDebugDetail(message.payload || {}) });

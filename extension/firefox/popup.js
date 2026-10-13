@@ -10,8 +10,9 @@ function renderWebsimAccount(state) { const node=$('websim-account'); if (!state
 function render(state) {
   currentState = state;
   $('enabled').checked = state.enabled !== false;
+  $('global-visibility').value = state.globalVisibility || state.visibility || 'private';
   $('visibility').value = state.visibility || 'private';
-  $('visibility-scope').textContent = state.visibilityScope === 'project-tab' ? 'Saved for this project in this tab' : 'Default for new repositories';
+  $('visibility-scope').textContent = state.visibilityScope === 'project' ? 'Saved for this project' : 'No project open · shows the global default';
   $('branchMode').value = state.branchMode || 'main';
   $('customBranch').value = state.customBranch || '';
   $('advanced-logs').checked = state.advancedLogs === true;
@@ -57,14 +58,31 @@ $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   await saveSettings({ clearToken:true });
 });
-async function saveSettings({ clearToken = false } = {}) {
+async function saveSettings({ clearToken = false, includeVisibility = false } = {}) {
   message(clearToken ? 'Saving connection…' : 'Updating repository visibility…');
   const tab = await activeTab();
-  const result = await send({ type:'SAVE_SETTINGS', settings:{ token:$('token').value.trim(), visibility:$('visibility').value, branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked }, tabId:tab?.id, url:tab?.url, title:tab?.title });
+  const settings={ token:$('token').value.trim(), branchMode:$('branchMode').value, customBranch:$('customBranch').value.trim(), enabled:$('enabled').checked };
+  if (includeVisibility) settings.visibility=$('visibility').value;
+  const result = await send({ type:'SAVE_SETTINGS', settings, tabId:tab?.id, url:tab?.url, title:tab?.title });
   if (result?.ok) { if (clearToken) $('token').value=''; message(result.message || 'Saved locally.'); render(await stateForActiveTab()); refreshProjectLink(); }
   else message(result?.message || 'Could not update repository visibility.', true);
 }
-$('visibility').addEventListener('change', () => saveSettings());
+$('visibility').addEventListener('change', () => saveSettings({ includeVisibility:true }));
+$('global-visibility').addEventListener('change', async () => {
+  const visibility = $('global-visibility').value;
+  if (visibility === 'public' && !window.confirm('Are you sure you want all new project repositories to be public? Existing project-specific settings will stay as they are.')) {
+    $('global-visibility').value = currentState?.globalVisibility || 'private';
+    return;
+  }
+  const result = await send({ type:'SET_GLOBAL_VISIBILITY', visibility });
+  if (result?.ok) {
+    message(`Global default set to ${visibility}. Existing project settings were preserved.`);
+    render(await stateForActiveTab());
+  } else {
+    $('global-visibility').value = currentState?.globalVisibility || 'private';
+    message(result?.message || 'Could not update the global visibility default.', true);
+  }
+});
 $('branchMode').addEventListener('change', () => $('custom-branch-wrap').classList.toggle('hidden', $('branchMode').value !== 'custom'));
 $('advanced-logs').addEventListener('change', async () => { const result = await send({ type:'SET_DEBUG_MODE', enabled:$('advanced-logs').checked }); if (result?.ok) message(result.advancedLogs ? 'Advanced logs enabled. Clear logs, then pin a project.' : 'Advanced logs disabled.'); else message('Could not update advanced logging.', true); });
 $('copy-logs').addEventListener('click', copyLogs);

@@ -173,7 +173,7 @@
   }
 
   function visibilityKey(projectId, tabId) {
-    return syncKey(projectId, tabId);
+    return String(projectId || '');
   }
 
   function normalizedVisibility(value) {
@@ -181,7 +181,10 @@
   }
 
   function visibilityForContext(settings, projectId, tabId) {
-    const scoped = projectId ? settings.visibilityByContext?.[visibilityKey(projectId, tabId)] : null;
+    const overrides = settings.visibilityByContext || {};
+    const scoped = projectId
+      ? overrides[visibilityKey(projectId, tabId)] ?? overrides[syncKey(projectId, tabId)] ?? Object.entries(overrides).find(([key]) => key.endsWith(`:${projectId}`))?.[1]
+      : null;
     return normalizedVisibility(scoped ?? settings.visibility);
   }
 
@@ -525,7 +528,8 @@
     return {
       ...stored,
       visibility: visibilityForContext(stored, projectId, tabId),
-      visibilityScope: projectId ? 'project-tab' : 'default',
+      globalVisibility: normalizedVisibility(stored.visibility),
+      visibilityScope: projectId ? 'project' : 'default',
       activeTabId: tabId,
       activeProjectId: projectId,
       isWebsimTab,
@@ -1303,7 +1307,7 @@
         const generatedName = generatedRepoName(projectId, message.title || project.title, project.slug);
         const names = [...new Set([mapped?.repo, generatedName].filter(Boolean))];
         repository = await findExistingRepository(owner, token, projectId, names);
-        if (repository && Boolean(repository.private) !== (visibility === 'private')) {
+        if (repository && Object.prototype.hasOwnProperty.call(incoming, 'visibility') && Boolean(repository.private) !== (visibility === 'private')) {
           await githubRequest(repoPath(owner, repository.name), token, {
             method: 'PATCH',
             body: JSON.stringify({ private: visibility === 'private' }),
@@ -1325,21 +1329,21 @@
       ...incoming,
       token,
       owner,
-      // A project/tab selection must not overwrite the default used by other
-      // projects, while a default selection must persist globally.
+      // A project selection must not overwrite the default used by other
+      // projects, while a global selection must persist across projects.
       visibility: projectId ? normalizedVisibility(stored.visibility) : visibility
     };
-    if (projectId && !ownershipBlocked) {
+    if (projectId && !ownershipBlocked && Object.prototype.hasOwnProperty.call(incoming, 'visibility')) {
       next.visibilityByContext = {
         ...(stored.visibilityByContext || {}),
         [visibilityKey(projectId, tabId)]: visibility
       };
-    } else {
+    } else if (!projectId) {
       next.visibility = visibility;
     }
     await storageSet(next);
 
-    const repositoryMessage = repository
+    const repositoryMessage = repository && Object.prototype.hasOwnProperty.call(incoming, 'visibility')
       ? ` Updated ${owner}/${repository.name} to ${visibility}.`
       : '';
     return {
@@ -1349,8 +1353,15 @@
       visibility,
       message: ownershipBlocked
         ? `GitHub connection saved. Project-specific settings were not changed: ${ownershipBlocked.message}`
-        : `${projectId ? 'Saved for this project and tab.' : 'Saved as the default for new repositories.'}${repositoryMessage}`
+        : `${projectId ? (Object.prototype.hasOwnProperty.call(incoming, 'visibility') ? 'Saved for this project.' : 'Connection saved.') : 'Saved as the default for new repositories.'}${repositoryMessage}`
     };
+  }
+
+  async function setGlobalVisibility(message) {
+    const visibility = normalizedVisibility(message.visibility);
+    await storageSet({ visibility });
+    await debugLog('settings.visibility.global.updated', { visibility, overridesPreserved: true });
+    return { ok: true, visibility };
   }
 
   if (api.webRequest?.onBeforeRequest) {
@@ -1505,6 +1516,10 @@
     }
     if (message?.type === 'SAVE_SETTINGS') {
       saveSettings(message).then(sendResponse).catch((error) => sendResponse({ ok: false, message: error.message }));
+      return true;
+    }
+    if (message?.type === 'SET_GLOBAL_VISIBILITY') {
+      setGlobalVisibility(message).then(sendResponse).catch((error) => sendResponse({ ok: false, message: error.message }));
       return true;
     }
     if (message?.type === 'PIN_DETECTED') {

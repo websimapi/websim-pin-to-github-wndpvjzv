@@ -33,8 +33,9 @@ function renderWebsimAccount(state) {
 function render(state) {
   currentState = state;
   $('enabled').checked = state.enabled !== false;
+  $('global-visibility').value = state.globalVisibility || state.visibility || 'private';
   $('visibility').value = state.visibility || 'private';
-  $('visibility-scope').textContent = state.visibilityScope === 'project-tab' ? 'Saved for this project in this tab' : 'Default for new repositories';
+  $('visibility-scope').textContent = state.visibilityScope === 'project' ? 'Saved for this project' : 'No project open · shows the global default';
   $('branchMode').value = state.branchMode || 'main';
   $('customBranch').value = state.customBranch || '';
   $('advanced-logs').checked = state.advancedLogs === true;
@@ -119,18 +120,19 @@ $('settings-form').addEventListener('submit', async (event) => {
   await saveSettings({ clearToken: true });
 });
 
-async function saveSettings({ clearToken = false } = {}) {
+async function saveSettings({ clearToken = false, includeVisibility = false } = {}) {
   showMessage(clearToken ? 'Saving connection…' : 'Updating repository visibility…');
   const tab = await activeTab();
-  const result = await send({ type: 'SAVE_SETTINGS', settings: {
+  const settings = {
     // Include a token typed into the popup so a first-time visibility change
     // can save the connection and update the selected project in one action.
     token: $('token').value.trim(),
-    visibility: $('visibility').value,
     branchMode: $('branchMode').value,
     customBranch: $('customBranch').value.trim(),
     enabled: $('enabled').checked
-  }, tabId: tab?.id, url: tab?.url, title: tab?.title });
+  };
+  if (includeVisibility) settings.visibility = $('visibility').value;
+  const result = await send({ type: 'SAVE_SETTINGS', settings, tabId: tab?.id, url: tab?.url, title: tab?.title });
   if (result?.ok) {
     if (clearToken) $('token').value = '';
     showMessage(result.message || 'Saved locally.');
@@ -141,9 +143,23 @@ async function saveSettings({ clearToken = false } = {}) {
   }
 }
 
-// Visibility is project/tab-scoped, so apply it as soon as the active tab's
-// selection changes instead of requiring an unrelated form submission.
-$('visibility').addEventListener('change', () => saveSettings());
+// Apply project overrides as soon as the active project's selection changes.
+$('visibility').addEventListener('change', () => saveSettings({ includeVisibility: true }));
+$('global-visibility').addEventListener('change', async () => {
+  const visibility = $('global-visibility').value;
+  if (visibility === 'public' && !window.confirm('Are you sure you want all new project repositories to be public? Existing project-specific settings will stay as they are.')) {
+    $('global-visibility').value = currentState?.globalVisibility || 'private';
+    return;
+  }
+  const result = await send({ type: 'SET_GLOBAL_VISIBILITY', visibility });
+  if (result?.ok) {
+    showMessage(`Global default set to ${visibility}. Existing project settings were preserved.`);
+    render(await stateForActiveTab());
+  } else {
+    $('global-visibility').value = currentState?.globalVisibility || 'private';
+    showMessage(result?.message || 'Could not update the global visibility default.', true);
+  }
+});
 
 $('branchMode').addEventListener('change', () => $('custom-branch-wrap').classList.toggle('hidden', $('branchMode').value !== 'custom'));
 $('advanced-logs').addEventListener('change', async () => {
