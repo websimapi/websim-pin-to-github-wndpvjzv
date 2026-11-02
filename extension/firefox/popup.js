@@ -49,10 +49,18 @@ function formatLogs(logs) {
   }).join('\n');
 }
 async function copyLogs() {
-  const text = $('logs-output').textContent;
+  const state = await stateForActiveTab();
+  render(state);
+  const header = [
+    'Pin to GitHub debug export · v' + (api.runtime.getManifest()?.version || 'unknown'),
+    'Captured: ' + new Date().toISOString(),
+    'Project: ' + (state?.activeProjectId || 'unknown'),
+    'Events: ' + (state?.debugLogs || []).length
+  ].join('\n');
+  const text = header + '\n\n' + $('logs-output').textContent;
   try { await navigator.clipboard.writeText(text); }
   catch { const area=document.createElement('textarea'); area.value=text; document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove(); }
-  message('Diagnostic logs copied to clipboard.');
+  message('Fresh diagnostic log export copied.');
 }
 $('settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();

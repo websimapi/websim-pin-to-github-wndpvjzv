@@ -104,7 +104,15 @@ function formatLogs(logs) {
   }).join('\n');
 }
 async function copyLogs() {
-  const text = $('logs-output').textContent;
+  const state = await stateForActiveTab();
+  render(state);
+  const header = [
+    'Pin to GitHub debug export · v' + (api.runtime.getManifest()?.version || 'unknown'),
+    'Captured: ' + new Date().toISOString(),
+    'Project: ' + (state?.activeProjectId || 'unknown'),
+    'Events: ' + (state?.debugLogs || []).length
+  ].join('\n');
+  const text = header + '\n\n' + $('logs-output').textContent;
   try {
     await navigator.clipboard.writeText(text);
   } catch {
@@ -112,7 +120,7 @@ async function copyLogs() {
     area.value = text; document.body.appendChild(area); area.select();
     document.execCommand('copy'); area.remove();
   }
-  showMessage('Diagnostic logs copied to clipboard.');
+  showMessage('Fresh diagnostic log export copied.');
 }
 
 $('settings-form').addEventListener('submit', async (event) => {

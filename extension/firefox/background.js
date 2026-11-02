@@ -56,7 +56,7 @@
   }
   function debugLog(event, detail = {}) {
     const entry = { at:new Date().toISOString(), event, ...scopedLogDetail(detail) };
-    logQueue = logQueue.then(async () => { const stored = await storageGet({ debugLogs:[] }); await storageSet({ debugLogs:[...(stored.debugLogs || []), entry].slice(-160) }); }).catch(() => {});
+    logQueue = logQueue.then(async () => { const stored = await storageGet({ debugLogs:[] }); await storageSet({ debugLogs:[...(stored.debugLogs || []), entry].slice(-400) }); }).catch(() => {});
     return logQueue;
   }
   function safeDebugDetail(detail = {}) { return Object.fromEntries(Object.entries(detail).slice(0,24).map(([key,value]) => { if (typeof value === 'string') return [key,value.replace(/([?&](?:token|access_token|authorization|code|key)=)[^&]*/gi,'$1[redacted]').slice(0,400)]; if (typeof value === 'number' || typeof value === 'boolean' || value === null) return [key,value]; return [key,String(value).slice(0,400)]; })); }
@@ -119,7 +119,7 @@
     catch (error) { await debugLog('github.error', { method, path, status:error.status || null, message:error.message }); throw error; }
   }
   function unwrap(data, key) { if (data?.[key]?.data) return data[key].data; if (Array.isArray(data?.[key])) return data[key]; if (Array.isArray(data?.data)) return data.data; return []; }
-  function rev(item) { return item?.project_revision || item?.revision || item; }
+  function rev(item) { const revision=item?.project_revision || item?.revision || item, site=item?.site || revision?.site; return site && revision && typeof revision === 'object' ? { ...revision, site } : revision; }
   function repoPath(owner, repo) { return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`; }
   function generatedRepoName(id, title, slug) {
     const readable = String(slug || title || 'websim-project').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,54) || 'project';
@@ -269,12 +269,35 @@
     } finally { automaticSyncChecks.delete(checkKey); }
   }
   async function currentRevision(id) {
-    let project = {}; try { project = await wsJson(`/projects/${encodeURIComponent(id)}`); } catch {}
-    const data = project.project || project.site || project, direct = data.current_revision || data.currentRevision || data.revision, directVersion = data.current_version ?? data.currentVersion ?? direct?.version;
-    if (directVersion !== undefined && directVersion !== null) return { version:directVersion, revision:rev(direct || { version:directVersion }) };
-    const list = unwrap(await wsJson(`/projects/${encodeURIComponent(id)}/revisions?first=50`), 'revisions').map(rev).filter(Boolean).sort((a,b) => Number(a.version ?? a.revision_number ?? 0) - Number(b.version ?? b.revision_number ?? 0));
-    if (!list.length) throw new Error('No Websim revision was found for this project');
-    return { version:list.at(-1).version ?? list.at(-1).revision_number, revision:list.at(-1) };
+    let project = {}; try { project = await wsJson('/projects/' + encodeURIComponent(id)); } catch {}
+    const data = project.project || project.site || project;
+    const direct = data.current_revision || data.currentRevision || data.revision;
+    const directVersion = data.current_version ?? data.currentVersion ?? direct?.version;
+    const directRevision = direct ? rev(direct) : (directVersion !== undefined && directVersion !== null ? { version: directVersion } : null);
+    let list = [];
+    try { list = unwrap(await wsJson('/projects/' + encodeURIComponent(id) + '/revisions?first=50'), 'revisions').map(rev).filter(Boolean); }
+    catch (error) {
+      if (!directRevision) throw error;
+      await debugLog('websim.revision.history.unavailable', { version: directVersion ?? directRevision.version ?? null, message: error.message });
+      return { version: directVersion ?? directRevision.version, revision: directRevision };
+    }
+    list.sort((a,b) => Number(a.version ?? a.revision_number ?? 0) - Number(b.version ?? b.revision_number ?? 0));
+    const targetVersion = directVersion ?? directRevision?.version;
+    let revision = targetVersion !== undefined && targetVersion !== null ? list.find((item) => String(item.version ?? item.revision_number) === String(targetVersion)) : list.at(-1);
+    revision ||= directRevision;
+    if (!revision) throw new Error('No Websim revision was found for this project');
+    const version = revision.version ?? revision.revision_number ?? targetVersion;
+    if (!revisionPrompt(revision) && version !== undefined && version !== null) {
+      try {
+        const detail = await wsJson('/projects/' + encodeURIComponent(id) + '/revisions/' + encodeURIComponent(version));
+        if (detail?.site) revision = { ...revision, site: detail.site };
+        else if (detail?.project_revision) revision = rev(detail);
+        else if (detail?.prompt) revision = { ...revision, prompt: detail.prompt };
+      } catch (error) { await debugLog('websim.revision.detail.unavailable', { version, status: error.status || null }); }
+    }
+    const prompt = revisionPrompt(revision);
+    await debugLog('websim.revision.selected', { version, promptAvailable: Boolean(prompt), promptField: prompt?.key || null });
+    return { version, revision };
   }
   async function ensureRepository(payload, revision, settings, tabId) {
     const user = await gh('/user', settings.token), owner = user.login, mapped = settings.projectMap?.[payload.projectId], visibility = visibilityForContext(settings, payload.projectId, tabId);
@@ -302,15 +325,43 @@
     if (!Object.keys(files).length) throw new Error('The revision did not expose any files');
     return files;
   }
+  // The commit subject is "V<version>: <prompt>" so history shows the prompt that
+  // produced each pinned version. Only the revision's own prompt is used; the
+  // project title is a fallback so a commit is never blocked by a missing prompt.
+  // The API returns the revision's recorded prompt on its related site object.
+  // Keep compatibility with older/alternate response shapes as secondary sources.
+  const REVISION_PROMPT_FIELDS = ['prompt', 'user_prompt', 'userPrompt', 'prompt_text'];
+  function revisionPrompt(revision) {
+    const candidates = [
+      ['site.prompt.text', revision?.site?.prompt?.text],
+      ['site.prompt_data_override.text', revision?.site?.prompt_data_override?.text],
+      ['site.prompt_data.text', revision?.site?.prompt_data?.text],
+      ['prompt.text', revision?.prompt?.text],
+      ['prompt_data_override.text', revision?.prompt_data_override?.text],
+      ['prompt_data.text', revision?.prompt_data?.text],
+      ...REVISION_PROMPT_FIELDS.map((key) => [key, revision?.[key]])
+    ];
+    for (const [key, value] of candidates) {
+      if (typeof value === 'string' && value.trim()) return { text: value, key };
+    }
+    return null;
+  }
+  function commitMessage(version, text) {
+    return `V${version}: ${String(text || 'Websim project').replace(/\s+/g, ' ').trim().slice(0, 120)}`;
+  }
+
   async function commit(files, payload, revision, settings, target) {
     const base = repoPath(target.owner, target.repo), branch = encodeURIComponent(target.branch);
     const version = revision.version ?? revision.revision_number ?? payload.version ?? '?', title = String(payload.title || revision.title || payload.projectId || 'Websim project').replace(/[\r\n]+/g,' ').slice(0,120);
+    const prompt=revisionPrompt(revision), message=commitMessage(version, prompt?.text || title);
+    const normalizedPromptLength = prompt ? prompt.text.replace(/\s+/g, ' ').trim().length : 0;
+    await debugLog('git.commit.message', { version, promptField:prompt?.key || null, promptLength:normalizedPromptLength, subjectLength:message.length, promptTruncated:normalizedPromptLength > 120, fallback:prompt ? null : 'title' });
     await debugLog('git.bootstrap.start', { owner:target.owner, repo:target.repo, branch:target.branch, emptyRepository:Boolean(target.empty), fileCount:Object.keys(files).length });
     if (target.empty) {
       const bootstrapPath=files['index.html'] ? 'index.html' : Object.keys(files)[0];
       let bootstrap=null;
       try {
-        bootstrap=await gh(`${base}/contents/${bootstrapPath.split('/').map(encodeURIComponent).join('/')}`, settings.token, { method:'PUT', body:JSON.stringify({ message:`v${version}: ${title}`, content:b64(files[bootstrapPath]), branch:target.defaultBranch || 'main' }), headers:{'Content-Type':'application/json'} });
+        bootstrap=await gh(`${base}/contents/${bootstrapPath.split('/').map(encodeURIComponent).join('/')}`, settings.token, { method:'PUT', body:JSON.stringify({ message, content:b64(files[bootstrapPath]), branch:target.defaultBranch || 'main' }), headers:{'Content-Type':'application/json'} });
       } catch (error) {
         if (![409,422].includes(error.status)) throw error;
         const refreshed=await gh(base, settings.token);
@@ -334,7 +385,7 @@
     const entries = await Promise.all(Object.entries(files).map(async ([path, bytes]) => ({ path, mode:'100644', type:'blob', sha:(await gh(`${base}/git/blobs`, settings.token, { method:'POST', body:JSON.stringify({ content:b64(bytes), encoding:'base64' }), headers:{'Content-Type':'application/json'} })).sha })));
     const tree = await gh(`${base}/git/trees`, settings.token, { method:'POST', body:JSON.stringify({ base_tree:parent?.tree?.sha, tree:entries }), headers:{'Content-Type':'application/json'} });
     await debugLog('git.tree.created', { owner:target.owner, repo:target.repo, treeSha:tree.sha, parentSha:parentSha || null });
-    let created = await gh(`${base}/git/commits`, settings.token, { method:'POST', body:JSON.stringify({ message:`v${version}: ${title}`, tree:tree.sha, ...(parentSha ? { parents:[parentSha] } : {}) }), headers:{'Content-Type':'application/json'} });
+    let created = await gh(`${base}/git/commits`, settings.token, { method:'POST', body:JSON.stringify({ message, tree:tree.sha, ...(parentSha ? { parents:[parentSha] } : {}) }), headers:{'Content-Type':'application/json'} });
     await debugLog('git.commit.created', { owner:target.owner, repo:target.repo, branch:target.branch, commitSha:created.sha, parentSha:parentSha || null });
     let refParentSha = parentSha, refExists = branchExists, refUpdated = false;
     for (let attempt = 0; attempt < 3 && !refUpdated; attempt += 1) {
@@ -349,7 +400,7 @@
         if (latestParentSha === created.sha) { refUpdated = true; break; }
         const latestParent = await gh(`${base}/git/commits/${latestParentSha}`, settings.token);
         const retryTree = await gh(`${base}/git/trees`, settings.token, { method:'POST', body:JSON.stringify({ base_tree:latestParent.tree?.sha, tree:entries }), headers:{'Content-Type':'application/json'} });
-        created = await gh(`${base}/git/commits`, settings.token, { method:'POST', body:JSON.stringify({ message:`v${version}: ${title}`, tree:retryTree.sha, parents:[latestParentSha] }), headers:{'Content-Type':'application/json'} });
+        created = await gh(`${base}/git/commits`, settings.token, { method:'POST', body:JSON.stringify({ message, tree:retryTree.sha, parents:[latestParentSha] }), headers:{'Content-Type':'application/json'} });
         refParentSha = latestParentSha;
         refExists = true;
         await debugLog('git.ref.retry', { owner:target.owner, repo:target.repo, branch:target.branch, attempt:attempt + 1, previousParentSha:parentSha || null, latestParentSha, retryCommitSha:created.sha });
